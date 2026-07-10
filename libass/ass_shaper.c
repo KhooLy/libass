@@ -783,7 +783,14 @@ void ass_shaper_determine_script(ASS_Shaper *shaper, GlyphInfo *glyphs,
     // determine script (forward scan)
     for (i = 0; i < len; i++) {
         GlyphInfo *info = glyphs + i;
-        info->script = hb_unicode_script(ufuncs, info->symbol);
+        unsigned symbol = info->symbol;
+        if (symbol < 0x80) {
+            info->script = (symbol >= 'A' && symbol <= 'Z') ||
+                           (symbol >= 'a' && symbol <= 'z') ?
+                           HB_SCRIPT_LATIN : HB_SCRIPT_COMMON;
+        } else {
+            info->script = hb_unicode_script(ufuncs, symbol);
+        }
 
         // common/inherit codepoints inherit script from context
         if (info->script == HB_SCRIPT_COMMON ||
@@ -1188,8 +1195,17 @@ FriBidiStrIndex *ass_shaper_reorder(ASS_Shaper *shaper, TextInfo *text_info)
     int i, ret;
 
     // Initialize reorder map
-    for (i = 0; i < text_info->length; i++)
+    bool needs_reorder = false;
+    for (i = 0; i < text_info->length; i++) {
         shaper->cmap[i] = i;
+        needs_reorder |= shaper->emblevels[i] != 0;
+    }
+
+    // Level-zero lines are already in visual order. With flags == 0 and no
+    // visual string, fribidi_reorder_line can only leave this identity map and
+    // the already-zero levels unchanged.
+    if (!needs_reorder)
+        return shaper->cmap;
 
     // Create reorder map line-by-line or run-by-run
     int last_break = 0;

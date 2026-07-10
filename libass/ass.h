@@ -320,7 +320,7 @@ typedef enum {
     ASS_FEATURE_MOTION_CACHE,
 
     /**
-     * Cache the laid-out state of static subtitle events across frames.
+     * Retain cached static subtitle layouts across inactive periods.
      *
      * The parse/shape/layout pipeline (text parsing, HarfBuzz/FriBidi shaping,
      * glyph retrieval, wrapping, reordering, alignment, bounding box and
@@ -328,17 +328,18 @@ typedef enum {
      * configuration for events that contain no time-dependent overrides. Yet it
      * is re-run identically on every frame an event is visible, which for
      * typical dialogue and signs is the dominant cost and almost entirely
-     * redundant. When this feature is enabled, the renderer snapshots that
-     * laid-out state the first time a static event is rendered and restores it
-     * on subsequent frames, skipping straight to bitmap generation and
-     * compositing (which already have their own caches).
+     * redundant. The renderer normally snapshots that laid-out state while an
+     * event remains active on consecutive frames, then promptly releases it.
+     * Enabling this feature retains snapshots for inactive events too, which
+     * avoids rebuilding them after seeks or when replaying the same track at the
+     * cost of potentially retaining substantially more memory.
      *
      * Only events with no time-dependent tags (\t, \move, \fad/\fade,
      * \k/\K/\kf/\ko) and no scrolling/banner transition effect are cached;
      * everything else falls back to the normal per-frame path. The cached and
      * non-cached paths produce byte-identical output.
      *
-     * This is incompatible with VSFilter and disabled by default.
+     * This is a performance-only extension and disabled by default.
      */
     ASS_FEATURE_CACHE_LAYOUT,
 

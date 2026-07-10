@@ -394,6 +394,7 @@ struct cache_client {
 #endif
 };
 
+#define CACHE_BUCKETS (1u << 16)
 #define CACHE_ALIGN 8
 #define CACHE_ITEM_SIZE ((sizeof(CacheItem) + (CACHE_ALIGN - 1)) & ~(CACHE_ALIGN - 1))
 
@@ -414,7 +415,9 @@ Cache *ass_cache_create(const CacheDesc *desc)
     Cache *cache = calloc(1, sizeof(*cache));
     if (!cache)
         return NULL;
-    cache->buckets = 0xFFFF;
+    // wyhash distributes low bits uniformly, so a power-of-two table can use a
+    // mask instead of a 64-bit remainder on every cache lookup.
+    cache->buckets = CACHE_BUCKETS;
     cache->queue_last = &cache->queue_first;
     cache->desc = desc;
     cache->map = calloc(cache->buckets, sizeof(CacheItem *));
@@ -517,7 +520,7 @@ void *ass_cache_get(Cache *cache, CacheClient *client, void *key, void *priv)
     const CacheDesc *desc = cache->desc;
     size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
     ass_hashcode hash = desc->hash_func(key, ASS_HASH_INIT);
-    unsigned bucket = hash % cache->buckets;
+    unsigned bucket = hash & (CACHE_BUCKETS - 1);
 
     CacheItem *_Atomic *bucketptr = &cache->map[bucket];
     CacheItem *stop_at = NULL;

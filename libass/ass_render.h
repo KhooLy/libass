@@ -348,11 +348,12 @@ typedef struct {
     size_t composite_max_size;
 } CacheStore;
 
-// One fully laid-out static event, cached across frames when
-// ASS_FEATURE_CACHE_LAYOUT is enabled. Built once (on a layout-cache miss for an
-// eligible event) right before render_and_combine_glyphs, restored on later
-// frames to skip the whole parse/shape/layout pipeline. Owns deep copies of the
-// laid-out glyphs (including cluster next-chains) and holds an inc_ref on each
+// One fully laid-out static event, cached across consecutive active frames.
+// ASS_FEATURE_CACHE_LAYOUT additionally retains inactive snapshots for seeks and
+// replays. Built once (on a layout-cache miss for an eligible event) right before
+// render_and_combine_glyphs, restored on later frames to skip the whole
+// parse/shape/layout pipeline. Owns deep copies of the laid-out glyphs (including
+// cluster next-chains) and holds an inc_ref on each
 // glyph's outline/font so they survive LRU eviction while the snapshot lives.
 // Snapshots are owned by a per-renderer intrusive registry (reg_next/reg_prev)
 // so the renderer can dec_ref/free them while its caches are still alive,
@@ -374,6 +375,7 @@ typedef struct {
 
 typedef struct layout_snapshot {
     uint32_t gen;               // renderer layout_gen this was built under
+    uint64_t last_used_frame;   // renderer layout_frame of the most recent use
 
     // deep-copied laid-out text_info payload
     GlyphInfo *glyphs;          // owned cluster-head array (length entries)
@@ -434,15 +436,17 @@ struct ass_renderer {
     ASS_Settings settings;
     int render_id;
 
-    // Layout cache (ASS_FEATURE_CACHE_LAYOUT). layout_gen is bumped on any
-    // layout-affecting change; snapshots store the gen they were built under and
-    // are invalidated on mismatch. layout_cache is the head of an intrusive
-    // registry of all live snapshots (so they can be freed/dec_ref'd while the
-    // caches are alive). layout_seen caches the track-side layout inputs that
-    // have no setter funnel, so ass_start_frame can bump layout_gen when they
-    // change.
+    // Static-event layout cache. layout_gen is bumped on any layout-affecting
+    // change; snapshots store the gen they were built under and are invalidated
+    // on mismatch. layout_frame bounds the default cache to recently active
+    // events; ASS_FEATURE_CACHE_LAYOUT retains snapshots across inactive gaps.
+    // layout_cache is the head of an intrusive registry of all live snapshots
+    // (so they can be freed/dec_ref'd while the caches are alive). layout_seen
+    // caches the track-side layout inputs that have no setter funnel, so
+    // ass_start_frame can bump layout_gen when they change.
     uint32_t layout_gen;
     uint32_t layout_gen_flushed;        // last gen the registry was flushed at
+    uint64_t layout_frame;
     LayoutSnapshot *layout_cache;
 #if ENABLE_THREADS
     pthread_mutex_t layout_cache_mutex;
@@ -505,8 +509,8 @@ typedef struct render_priv {
     int render_id;
     char *hard_overrides_text;
     bool has_hard_overrides;
-    // ASS_FEATURE_CACHE_LAYOUT: memoized time-dependent-tag scan (keyed on the
-    // event's Text pointer, like hard_overrides) and the cached layout snapshot.
+    // Static-layout cache: memoized time-dependent-tag scan (keyed on the event's
+    // Text pointer, like hard_overrides) and the cached layout snapshot.
     char *time_dep_text;
     bool has_time_dep_tags;
     LayoutSnapshot *layout;

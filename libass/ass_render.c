@@ -20,6 +20,7 @@
 #include "ass_compat.h"
 
 #include <assert.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <string.h>
@@ -81,8 +82,9 @@ static void image_pool_renderer_done(ImagePool *pool);
 static bool event_has_hard_overrides(ASS_Renderer *render_priv,
                                      ASS_Event *event);
 
-// Layout cache (ASS_FEATURE_CACHE_LAYOUT) — see ass_render.h:LayoutSnapshot.
+// Static-event layout cache — see ass_render.h:LayoutSnapshot.
 static void layout_cache_flush(ASS_Renderer *priv);
+static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame);
 static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv, ASS_Event *event);
 
 #if ENABLE_THREADS
@@ -791,6 +793,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     double y0 = (bbox->y_min + bbox->y_max) / 2.0;
     double dx = (bbox->x_max - bbox->x_min) / 2.0 + 64;
     double dy = (bbox->y_max - bbox->y_min) / 2.0 + 64;
+    bool affine = m[2][0] == 0. && m[2][1] == 0.;
 
     // Change input coordinates' origin to (x0, y0),
     // after that transformation x:[-dx, dx], y:[-dy, dy],
@@ -806,9 +809,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     double center[2] = { m[0][2] * w, m[1][2] * w };
     // Change output coordinates' origin to center,
     // m_xz and m_yz is skipped as it becomes 0 and no longer needed.
-    for (int i = 0; i < 2; i++)
-        for (int j = 0; j < 2; j++)
-            m[i][j] -= m[2][j] * center[i];
+    if (!affine) {
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+                m[i][j] -= m[2][j] * center[i];
+    }
 
     double delta[2] = {0};
     if (!first) {
@@ -826,9 +831,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     }
 
     // Minimal bounding box z coordinate
-    double z0 = m[2][2] - fabs(m[2][0]) * dx - fabs(m[2][1]) * dy;
+    double z0 = affine ? m[2][2] :
+        m[2][2] - fabs(m[2][0]) * dx - fabs(m[2][1]) * dy;
     // z0 clamped to z_center / MAX_PERSP_SCALE to mitigate problems with small z
-    w = 1.0 / POSITION_PRECISION / FFMAX(z0, m[2][2] / MAX_PERSP_SCALE);
+    w = 1.0 / POSITION_PRECISION /
+        (affine ? z0 : FFMAX(z0, m[2][2] / MAX_PERSP_SCALE));
     double mul[2] = { dx * w, dy * w };  // 1 / q_x, 1 / q_y
 
     // z0 = m_zz - |m_zx| * dx - |m_zy| * dy,
@@ -905,11 +912,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     mul[0] *= w;
     mul[1] *= w;
 
-    for (int j = 0; j < 2; j++) {
-        double val = m[2][j] * mul[j];
-        if (!(fabs(val) < max_val))
-            return false;
-        qm[2][j] = ass_lrint(val);
+    if (affine) {
+        qm[2][0] = qm[2][1] = 0;
+    } else {
+        for (int j = 0; j < 2; j++) {
+            double val = m[2][j] * mul[j];
+            if (!(fabs(val) < max_val))
+                return false;
+            qm[2][j] = ass_lrint(val);
+        }
     }
 
     if (first && offset) {
@@ -926,6 +937,29 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     key->matrix_y.x = qm[1][0];  key->matrix_y.y = qm[1][1];
     key->matrix_z.x = qm[2][0];  key->matrix_z.y = qm[2][1];
     return true;
+}
+
+static inline double scale_by_pow2(double value, int exponent)
+{
+    // These small exponents cover normal subtitle scaling. Multiplication by
+    // an exactly represented power of two has the same result as ldexp on a
+    // binary floating-point implementation, but avoids an out-of-line libm
+    // call on platforms without a scale opcode.
+#if FLT_RADIX == 2
+    switch (exponent) {
+    case -4: return value * 0x1p-4;
+    case -3: return value * 0x1p-3;
+    case -2: return value * 0x1p-2;
+    case -1: return value * 0x1p-1;
+    case  0: return value;
+    case  1: return value * 0x1p1;
+    case  2: return value * 0x1p2;
+    case  3: return value * 0x1p3;
+    case  4: return value * 0x1p4;
+    default: break;
+    }
+#endif
+    return ldexp(value, exponent);
 }
 
 static int32_t round_to_step(int32_t value, int32_t step)
@@ -1843,8 +1877,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         w *= STROKER_PRECISION / POSITION_PRECISION;
         frexp(w * (FFMAX(mxx, myx) + mzx * rz), &k->scale_ord_x);
         frexp(w * (FFMAX(mxy, myy) + mzy * rz), &k->scale_ord_y);
-        bord_x = ldexp(bord_x, k->scale_ord_x);
-        bord_y = ldexp(bord_y, k->scale_ord_y);
+        bord_x = scale_by_pow2(bord_x, k->scale_ord_x);
+        bord_y = scale_by_pow2(bord_y, k->scale_ord_y);
         if (!(bord_x < OUTLINE_MAX && bord_y < OUTLINE_MAX))
             return;
         k->border.x = ass_lrint(bord_x / STROKER_PRECISION);
@@ -1855,8 +1889,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         }
 
         for (int i = 0; i < 3; i++) {
-            m[i][0] = ldexp(m2[i][0], -k->scale_ord_x);
-            m[i][1] = ldexp(m2[i][1], -k->scale_ord_y);
+            m[i][0] = scale_by_pow2(m2[i][0], -k->scale_ord_x);
+            m[i][1] = scale_by_pow2(m2[i][1], -k->scale_ord_y);
             m[i][2] = m2[i][2];
         }
     }
@@ -3173,7 +3207,7 @@ static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
             track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_WHOLE_TEXT_LAYOUT));
 }
 
-// ---- Layout cache (ASS_FEATURE_CACHE_LAYOUT) ------------------------------
+// ---- Static-event layout cache -------------------------------------------
 //
 // For an event with no time-dependent overrides (and no scrolling transition),
 // the entire parse/shape/layout pipeline up to render_and_combine_glyphs is a
@@ -3291,6 +3325,34 @@ static void layout_cache_flush(ASS_Renderer *priv)
     }
 }
 
+// In the default bounded mode, drop snapshots that were not used in the
+// immediately preceding frame. Detach the stale entries under the registry
+// lock, then release their cache references outside it.
+static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame)
+{
+    LayoutSnapshot *stale = NULL;
+
+    layout_cache_lock(priv);
+    for (LayoutSnapshot *snap = priv->layout_cache, *next; snap; snap = next) {
+        next = snap->reg_next;
+        if (snap->last_used_frame >= oldest_frame)
+            continue;
+        layout_registry_unlink(priv, snap);
+        if (snap->back)
+            snap->back->layout = NULL;
+        snap->reg_next = stale;
+        stale = snap;
+    }
+    layout_cache_unlock(priv);
+
+    while (stale) {
+        LayoutSnapshot *next = stale->reg_next;
+        stale->reg_prev = stale->reg_next = NULL;
+        layout_snapshot_free_contents(stale);
+        stale = next;
+    }
+}
+
 void ass_render_priv_done(RenderPriv *priv)
 {
     if (!priv)
@@ -3337,6 +3399,7 @@ static void build_layout_snapshot(RenderContext *state, RenderPriv *rp,
     snap->owner = priv;
     snap->back = rp;
     snap->gen = priv->layout_gen;
+    snap->last_used_frame = priv->layout_frame;
 
     snap->glyphs = calloc(length, sizeof(GlyphInfo));
     if (length && !snap->glyphs) {
@@ -3716,11 +3779,9 @@ ass_render_event(RenderContext *state, EventImages *event_images)
     ASS_DRect bbox;
     bool built_layout = false;   // this frame built a fresh snapshot (miss path)
 
-    // Layout cache (ASS_FEATURE_CACHE_LAYOUT): on a hit, restore the laid-out
-    // state for this static event and skip the whole parse/shape/layout pipeline.
-    bool cache_enabled = render_priv->track->parser_priv->feature_flags &
-                         FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT);
-    RenderPriv *rp = cache_enabled ? get_render_priv(render_priv, event) : NULL;
+    // On a static-layout-cache hit, restore the laid-out state and skip the
+    // whole parse/shape/layout pipeline.
+    RenderPriv *rp = get_render_priv(render_priv, event);
     // A track can be shared by several renderers; the single per-event snapshot
     // slot belongs to whichever renderer filled it. Only the owning renderer may
     // use it — its outline/font refs live in that renderer's caches, so a foreign
@@ -3731,6 +3792,7 @@ ass_render_event(RenderContext *state, EventImages *event_images)
         if (rp->layout->gen == render_priv->layout_gen &&
                 restore_layout_snapshot(state, rp->layout, event,
                                         &device_x, &device_y, &bbox)) {
+            rp->layout->last_used_frame = render_priv->layout_frame;
             valign = state->alignment & 12;
             // A live snapshot always carries its combined bitmaps: restore them
             // and skip render_and_combine_glyphs too. Only on an OOM growing the
@@ -3927,7 +3989,7 @@ ass_render_event(RenderContext *state, EventImages *event_images)
     // Cache this static event's laid-out state so later frames hit. Eligible =
     // no scrolling/banner transition and no time-dependent override tags. Skip
     // when another renderer owns the snapshot slot for this shared event.
-    if (cache_enabled && rp && !foreign_snapshot &&
+    if (rp && !foreign_snapshot &&
             !(state->evt_type & (EVENT_HSCROLL | EVENT_VSCROLL)) &&
             !event_has_time_dependent_tags(rp, event)) {
         build_layout_snapshot(state, rp, device_x, device_y, &bbox);
@@ -4171,6 +4233,16 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
         layout_cache_flush(render_priv);
         render_priv->layout_gen_flushed = render_priv->layout_gen;
     }
+
+    // By default, snapshots cover runs of consecutive active frames only. The
+    // opt-in feature keeps the old persistent behavior for seek/replay-heavy
+    // clients. Pruning happens before workers start, after the previous frame is
+    // complete, so registry entries cannot be in use here.
+    render_priv->layout_frame++;
+    if (!(track->parser_priv->feature_flags &
+            FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT)) &&
+            render_priv->layout_frame > 1 && render_priv->layout_cache)
+        layout_cache_prune(render_priv, render_priv->layout_frame - 1);
 
     ass_cache_promote(&render_priv->cache.client_set);
     check_cache_limits(render_priv, &render_priv->cache);
