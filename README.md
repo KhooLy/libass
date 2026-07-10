@@ -4,7 +4,7 @@ libass is a portable subtitle renderer for the ASS/SSA (Advanced Substation Alph
 
 Get it
 ======
-See [GitHub releases](https://github.com/libass/libass/releases) for the latest release 0.18.2 (released 2026-07-01).
+See [GitHub releases](https://github.com/libass/libass/releases) for the latest release 0.18.3 (released 2026-07-10).
 See the [changelog](https://github.com/libass/libass/blob/master/Changelog) for a detailed list of changes.
 
 Source code is available from our [GitHub repository](https://github.com/libass/libass).

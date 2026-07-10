@@ -1,3 +1,12 @@
+libass (0.18.3)
+ * Enable bounded static-event layout caching across consecutive active frames
+   by default; ASS_FEATURE_CACHE_LAYOUT now retains entries across inactive gaps
+ * Optimize cache lookups, affine transforms, glyph scaling, ASCII script
+   detection, and left-to-right shaping and reordering paths
+ * Improve threaded event dispatch by respecting the configured thread total,
+   deferring worker-pool startup, and parallelizing two-event frames
+ * Fix thread-pool reconfiguration accounting and worker startup failure handling
+
 libass (0.18.2)
  * Add opt-in ASS_FEATURE_CACHE_LAYOUT layout cache, reusing combined bitmaps
    and emitted images on cache hits
