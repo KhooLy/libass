@@ -279,6 +279,7 @@ static void join_threads(ASS_Renderer *render_priv)
 
         render_priv->threads = NULL;
         render_priv->n_threads = 0;
+        render_priv->started_threads = 0;
     }
 }
 #endif
@@ -4061,7 +4062,7 @@ render_combined:
 }
 
 #if ENABLE_THREADS
-#define MIN_THREADED_EVENTS 4
+#define MIN_THREADED_EVENTS 2
 
 static void *run_thread(void *ptr)
 {
@@ -4078,6 +4079,7 @@ static void *run_thread(void *ptr)
     if (!success) {
         ass_msg(priv->library, MSGL_WARN, "Thread setup failed; disabling");
         priv->thread_start_failed = 1;
+        pthread_cond_broadcast(&priv->main_cond);
         goto fail;
     }
 
@@ -4558,22 +4560,27 @@ static int ass_detect_change(ASS_Renderer *priv)
 #if ENABLE_THREADS
 static bool start_threads(ASS_Renderer *priv)
 {
-    if (priv->n_threads == priv->settings.threads || priv->thread_start_failed)
+    // The calling thread renders from the same queue, so the pool only needs
+    // N - 1 workers to honor ass_set_threads(N).
+    unsigned workers = priv->settings.threads > 1 ?
+        priv->settings.threads - 1 : 0;
+
+    if (priv->n_threads == workers || priv->thread_start_failed)
         return true;
 
     join_threads(priv);
 
     priv->shutting_down = 0;
 
-    if (priv->settings.threads <= 1)
+    if (!workers)
         return true;
 
-    if (!(priv->threads = calloc(priv->settings.threads, sizeof(pthread_t)))) {
+    if (!(priv->threads = calloc(workers, sizeof(pthread_t)))) {
         ass_msg(priv->library, MSGL_ERR, "Allocation failure");
         return false;
     }
 
-    for (priv->n_threads = 0; priv->n_threads < priv->settings.threads; priv->n_threads++) {
+    for (priv->n_threads = 0; priv->n_threads < workers; priv->n_threads++) {
         if (pthread_create(&priv->threads[priv->n_threads], NULL, run_thread, priv) != 0) {
             pthread_mutex_lock(&priv->mutex);
             ass_msg(priv->library, MSGL_WARN, "Thread startup failure");
@@ -4674,13 +4681,17 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     }
 
 #if ENABLE_THREADS
-    if (!start_threads(priv))
+    bool parallel = cnt >= MIN_THREADED_EVENTS;
+
+    // Do not allocate and initialize the worker pool until a frame can actually
+    // use it. Once a pool exists, still run start_threads on light frames so a
+    // changed ass_set_threads setting tears down/reconfigures it promptly.
+    if ((parallel || priv->n_threads) && !start_threads(priv))
         return NULL;
 
     // Waking the worker pool is disproportionately expensive for tiny active
     // event sets; the serial path is byte-identical and much cheaper there.
-    if (priv->n_threads > 0 && !priv->thread_start_failed &&
-            cnt >= MIN_THREADED_EVENTS) {
+    if (parallel && priv->n_threads > 0 && !priv->thread_start_failed) {
         pthread_mutex_lock(&priv->mutex);
 
         while (priv->active_threads)
