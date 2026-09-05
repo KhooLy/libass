@@ -77,7 +77,6 @@ static bool text_info_init(TextInfo* text_info)
 }
 
 static ImagePool *image_pool_create(void);
-static void image_pool_maybe_destroy(ImagePool *pool);
 static void image_pool_renderer_done(ImagePool *pool);
 static bool event_has_hard_overrides(ASS_Renderer *render_priv,
                                      ASS_Event *event);
@@ -370,13 +369,11 @@ static inline void image_pool_lock(ImagePool *pool) { (void) pool; }
 static inline void image_pool_unlock(ImagePool *pool) { (void) pool; }
 #endif
 
-// Free the pool and all recycled shells once nothing references it anymore.
-static void image_pool_maybe_destroy(ImagePool *pool)
+// Called with the mutex held after dropping renderer or image ownership.
+// Only the final owner can see no renderer or live images and claim destruction;
+// callers must not access the pool after this releases the mutex.
+static void image_pool_unlock_or_destroy(ImagePool *pool)
 {
-    if (!pool)
-        return;
-
-    image_pool_lock(pool);
     if (pool->renderer_alive || pool->live) {
         image_pool_unlock(pool);
         return;
@@ -405,9 +402,7 @@ static void image_pool_renderer_done(ImagePool *pool)
 
     image_pool_lock(pool);
     pool->renderer_alive = false;
-    image_pool_unlock(pool);
-
-    image_pool_maybe_destroy(pool);
+    image_pool_unlock_or_destroy(pool);
 }
 
 // Obtain an ASS_ImagePriv shell, reusing a recycled one when available.
@@ -4623,8 +4618,7 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
         priv->result.next = (ASS_Image *) pool->free_list;
         pool->free_list = priv;
         pool->live--;
-        image_pool_unlock(pool);
-        image_pool_maybe_destroy(pool);
+        image_pool_unlock_or_destroy(pool);
     } else {
         free(priv);
     }
