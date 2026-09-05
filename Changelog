@@ -1,4 +1,4 @@
-libass (unreleased)
+libass (0.18.4)
  * Reuse compatible HarfBuzz subfonts within each shaping call to reduce
    allocation and font-setup overhead without changing rendered output
  * Avoid redundant image-pool locking when releasing images and renderer
