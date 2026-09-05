@@ -1,3 +1,7 @@
+libass (unreleased)
+ * Reuse compatible HarfBuzz subfonts within each shaping call to reduce
+   allocation and font-setup overhead without changing rendered output
+
 libass (0.18.3)
  * Enable bounded static-event layout caching across consecutive active frames
    by default; ASS_FEATURE_CACHE_LAYOUT now retains entries across inactive gaps

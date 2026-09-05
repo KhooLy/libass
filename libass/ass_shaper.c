@@ -704,6 +704,8 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
 {
     int i;
     hb_buffer_t *buf = shaper->buf;
+    hb_font_t *font = NULL;
+    const GlyphInfo *font_info = NULL;
     hb_segment_properties_t props = HB_SEGMENT_PROPERTIES_DEFAULT;
 
     // Initialize: skip all glyphs, this is undone later as needed
@@ -717,9 +719,18 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         }
 
         int offset = i;
-        hb_font_t *font = get_hb_font(shaper, glyphs + offset);
-        if (!font)
-            return false;
+        const GlyphInfo *info = glyphs + offset;
+        // These are all per-run inputs to get_hb_font. Glyph processing
+        // leaves them unchanged; features and segment properties stay per-run.
+        if (!font || font_info->font != info->font ||
+                font_info->face_index != info->face_index ||
+                font_info->font_size != info->font_size) {
+            hb_font_destroy(font);
+            font = get_hb_font(shaper, glyphs + offset);
+            if (!font)
+                return false;
+            font_info = info;
+        }
         int run_id = glyphs[offset].shape_run_id;
         int level = shaper->emblevels[offset];
 
@@ -760,10 +771,9 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         shape_harfbuzz_process_run(glyphs, buf,
                 shaper->whole_text_layout ? 0 : offset - lead_context);
         hb_buffer_reset(buf);
-
-        hb_font_destroy(font);
     }
 
+    hb_font_destroy(font);
     return true;
 }
 
