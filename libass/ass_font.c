@@ -271,7 +271,38 @@ uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol)
                 if (charset == ARABIC_CHARSET_TRADITIONAL)
                     return ass_font_charmap_arabic_traditional(symbol);
             }
-            return 0xF000 | symbol;
+
+            // GDI uses the first cmap format 4 segment's startCount.
+            // FT_Get_First_Char() is equivalent for well-formed charmaps.
+            FT_UInt gindex;
+            FT_ULong first_char = FT_Get_First_Char(face, &gindex);
+            uint32_t offset;
+            switch (first_char & 0xFF00) {
+            case 0xF000:
+                offset = 0xF000;
+                break;
+            case 0xE000: // EUDC fonts
+            case 0x0000:
+                offset = 0;
+                break;
+            default:
+                offset = (uint32_t) first_char - 0x20;
+                break;
+            }
+
+            bool is_symbol_glyph_set = offset || (os2 &&
+                os2->panose[0] == 5 && /* PAN_FAMILY_PICTORIAL */
+                (os2->fsSelection & 0xFF) == 0 /* ANSI_CHARSET */);
+            if (!is_symbol_glyph_set)
+                return symbol;
+
+            // As before, this does not emulate the system codepage.
+            // See https://github.com/libass/libass/issues/319.
+            if (symbol <= 0xFF)
+                return offset + symbol;
+            if (symbol >= 0xF020 && symbol <= 0xF0FF)
+                return offset + (symbol & 0xFF);
+            return 0;
         }
         case FT_ENCODING_MS_SJIS:
         case FT_ENCODING_MS_GB2312:

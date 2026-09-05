@@ -5,6 +5,10 @@ libass (unreleased)
    contexts without changing rendered output
  * Batch threaded event-completion accounting to reduce synchronization
    overhead without changing rendered output or worker wakeup policy
+ * Fix Microsoft symbol-font base offsets, including fonts mapped outside
+   the 0xF000 range, matching upstream symbol-font handling
+ * Update FreeBSD CI to 14.4 and its VM action to support FreeType's
+   base-system pkg-config dependencies
 
 libass (0.18.3)
  * Enable bounded static-event layout caching across consecutive active frames
