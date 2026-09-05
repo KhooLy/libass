@@ -4096,6 +4096,7 @@ static void *run_thread(void *ptr)
         pthread_mutex_unlock(&priv->mutex);
 
         uintptr_t got_eimg;
+        AtomicInt completed = 0;
         bool cascaded = false;
         while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1, memory_order_relaxed)) < atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
             // Cascade: wake one sibling the first time we confirm there is more
@@ -4114,10 +4115,14 @@ static void *run_thread(void *ptr)
             EventImages *imgs = priv->eimg + got_eimg;
 
             ass_render_event(&state, imgs);
-
-            if (atomic_fetch_sub_explicit(&priv->processing_eimgs, 1, memory_order_acq_rel) - 1 == 0)
-                break;
+            completed++;
         }
+
+        // Publish the whole batch; acq_rel RMWs also carry earlier batches'
+        // writes to the participant or acquire load that observes completion.
+        if (completed)
+            atomic_fetch_sub_explicit(&priv->processing_eimgs, completed,
+                                      memory_order_acq_rel);
 
         pthread_mutex_lock(&priv->mutex);
 
@@ -4705,25 +4710,26 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 
         // Release the lock so workers can start stealing immediately, and let
         // the main thread steal events from the same atomic queue instead of
-        // blocking idle until they finish. This makes the threaded path never
-        // slower than serial (the main thread does at least as much work as it
-        // would serially) and adds one more renderer for large event sets.
+        // blocking idle until they finish. This adds one more renderer for
+        // large event sets, but still incurs queue and synchronization costs.
         // Output is independent of which thread renders which event.
         pthread_mutex_unlock(&priv->mutex);
 
         bool main_done_all = false;
+        AtomicInt completed = 0;
         uintptr_t got_eimg;
         while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1,
                         memory_order_relaxed)) <
                 atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
             ass_render_event(&priv->state, priv->eimg + got_eimg);
-
-            if (atomic_fetch_sub_explicit(&priv->processing_eimgs, 1,
-                        memory_order_acq_rel) - 1 == 0) {
-                main_done_all = true;  // main rendered the last event
-                break;
-            }
+            completed++;
         }
+
+        // Only a nonempty batch can complete all outstanding work. Its acquire
+        // half observes earlier batch publications through the RMW sequence.
+        if (completed)
+            main_done_all = atomic_fetch_sub_explicit(&priv->processing_eimgs,
+                    completed, memory_order_acq_rel) == completed;
 
         // Main exhausted the queue; wait for workers to finish any remaining
         // events. (Re-checks the predicate under the lock, so a worker signal
