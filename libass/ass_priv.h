@@ -60,6 +60,7 @@ struct parser_priv {
     uint32_t *read_order_bitmap;
     int read_order_elems; // size in uint32_t units of read_order_bitmap
     int check_readorder;
+    unsigned events_gen;
 
     // tracks [Script Info] headers set by the script
     uint32_t header_flags;

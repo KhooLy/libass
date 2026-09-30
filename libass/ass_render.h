@@ -322,6 +322,20 @@ struct ass_renderer {
     EventImages *eimg;          // temporary buffer for sorting rendered events
     int eimg_size;              // allocated buffer size
 
+    struct {
+        ASS_Track *track;
+        ASS_Event *events;
+        int n_events;
+        unsigned gen;
+        bool valid;
+        long long t0;
+        int n_buckets;
+        int *bucket_start;
+        int *items;
+        int *long_items;
+        int n_long;
+    } ev_index;
+
     // frame-global data
     int width, height;          // screen dimensions (the whole frame from ass_set_frame_size)
     int frame_content_height;   // content frame height ( = screen height - API margins )

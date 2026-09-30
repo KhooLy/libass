@@ -126,6 +126,8 @@ int ass_alloc_event(ASS_Track *track)
 
     assert(track->n_events <= track->max_events);
 
+    track->parser_priv->events_gen++;
+
     if (track->n_events == track->max_events) {
         if (track->max_events >= FFMIN(SIZE_MAX, INT_MAX) / 2)
             return -1;
@@ -144,6 +146,7 @@ void ass_free_event(ASS_Track *track, int eid)
 {
     ASS_Event *event = track->events + eid;
 
+    track->parser_priv->events_gen++;
     free(event->Name);
     free(event->Effect);
     free(event->Text);

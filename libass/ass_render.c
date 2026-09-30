@@ -23,6 +23,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #ifdef CONFIG_UNIBREAK
 #include <linebreak.h>
@@ -172,6 +173,8 @@ fail:
     return NULL;
 }
 
+static void free_event_index(ASS_Renderer *priv);
+
 void ass_renderer_done(ASS_Renderer *render_priv)
 {
     if (!render_priv)
@@ -192,6 +195,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     if (render_priv->ftlibrary)
         FT_Done_FreeType(render_priv->ftlibrary);
     free(render_priv->eimg);
+    free_event_index(render_priv);
 
     render_context_done(&render_priv->state);
 
@@ -3358,6 +3362,165 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
     return next;
 }
 
+#define EV_BUCKET_MS 1000
+#define EV_MIN_INDEXED 2048
+#define EV_LONG_BUCKETS 32
+#define EV_MAX_BUCKETS (1 << 20)
+
+static void free_event_index(ASS_Renderer *priv)
+{
+    free(priv->ev_index.bucket_start);
+    free(priv->ev_index.items);
+    free(priv->ev_index.long_items);
+    memset(&priv->ev_index, 0, sizeof(priv->ev_index));
+}
+
+static bool event_buckets(const ASS_Event *e, long long t0, long long *b0, long long *b1)
+{
+    if (e->Duration <= 0)
+        return false;
+    *b0 = (e->Start - t0) / EV_BUCKET_MS;
+    *b1 = (e->Start + e->Duration - 1 - t0) / EV_BUCKET_MS;
+    return true;
+}
+
+static void build_event_index(ASS_Renderer *priv, ASS_Track *track)
+{
+    free_event_index(priv);
+    priv->ev_index.track = track;
+    priv->ev_index.events = track->events;
+    priv->ev_index.n_events = track->n_events;
+    priv->ev_index.gen = track->parser_priv->events_gen;
+
+    long long t0 = LLONG_MAX, t1 = LLONG_MIN;
+    for (int i = 0; i < track->n_events; i++) {
+        t0 = FFMIN(t0, track->events[i].Start);
+        t1 = FFMAX(t1, track->events[i].Start);
+    }
+    long long span = (t1 - t0) / EV_BUCKET_MS + 1;
+    if (span > EV_MAX_BUCKETS)
+        return;
+    int nb = span;
+
+    int *start = calloc(nb + 1, sizeof(int));
+    int *fill = malloc(nb * sizeof(int));
+    int *long_items = malloc(track->n_events * sizeof(int));
+    int *items = NULL;
+    int n_long = 0;
+    long long total = 0;
+    if (!start || !fill || !long_items)
+        goto fail;
+
+    for (int i = 0; i < track->n_events; i++) {
+        long long b0, b1;
+        if (!event_buckets(track->events + i, t0, &b0, &b1))
+            continue;
+        if (b1 - b0 >= EV_LONG_BUCKETS) {
+            long_items[n_long++] = i;
+            continue;
+        }
+        b1 = FFMIN(b1, nb - 1LL);
+        for (long long b = b0; b <= b1; b++)
+            start[b + 1]++;
+        total += b1 - b0 + 1;
+    }
+    for (int b = 0; b < nb; b++)
+        start[b + 1] += start[b];
+
+    items = malloc(FFMAX(total, 1) * sizeof(int));
+    if (!items)
+        goto fail;
+    memcpy(fill, start, nb * sizeof(int));
+    for (int i = 0; i < track->n_events; i++) {
+        long long b0, b1;
+        if (!event_buckets(track->events + i, t0, &b0, &b1))
+            continue;
+        if (b1 - b0 >= EV_LONG_BUCKETS)
+            continue;
+        b1 = FFMIN(b1, nb - 1LL);
+        for (long long b = b0; b <= b1; b++)
+            items[fill[b]++] = i;
+    }
+    free(fill);
+
+    priv->ev_index.t0 = t0;
+    priv->ev_index.n_buckets = nb;
+    priv->ev_index.bucket_start = start;
+    priv->ev_index.items = items;
+    priv->ev_index.long_items = long_items;
+    priv->ev_index.n_long = n_long;
+    priv->ev_index.valid = true;
+    return;
+
+fail:
+    free(start);
+    free(fill);
+    free(long_items);
+    free(items);
+}
+
+static bool event_active(const ASS_Event *event, long long now)
+{
+    return event->Start <= now && now < event->Start + event->Duration;
+}
+
+static int render_events_at(ASS_Renderer *priv, ASS_Track *track, long long now)
+{
+    int cnt = 0;
+    const int n = track->n_events;
+    bool indexed = n >= EV_MIN_INDEXED;
+    if (indexed) {
+        if (priv->ev_index.track != track || priv->ev_index.events != track->events ||
+            priv->ev_index.n_events != n ||
+            priv->ev_index.gen != track->parser_priv->events_gen)
+            build_event_index(priv, track);
+        indexed = priv->ev_index.valid;
+    }
+
+    int bi = 0, be = 0, li = 0;
+    const int *items = NULL, *long_items = NULL;
+    int n_long = 0;
+    if (indexed) {
+        long long b = now - priv->ev_index.t0;
+        if (b >= 0) {
+            b = FFMIN(b / EV_BUCKET_MS, priv->ev_index.n_buckets - 1LL);
+            items = priv->ev_index.items;
+            bi = priv->ev_index.bucket_start[b];
+            be = priv->ev_index.bucket_start[b + 1];
+        }
+        long_items = priv->ev_index.long_items;
+        n_long = priv->ev_index.n_long;
+    }
+
+    for (int k = 0;; k++) {
+        int i;
+        if (!indexed) {
+            if (k >= n)
+                break;
+            i = k;
+        } else {
+            bool have_b = bi < be, have_l = li < n_long;
+            if (!have_b && !have_l)
+                break;
+            if (have_b && (!have_l || items[bi] < long_items[li]))
+                i = items[bi++];
+            else
+                i = long_items[li++];
+        }
+        ASS_Event *event = track->events + i;
+        if (!event_active(event, now))
+            continue;
+        if (cnt >= priv->eimg_size) {
+            priv->eimg_size += 100;
+            priv->eimg = realloc(priv->eimg, priv->eimg_size * sizeof(EventImages));
+        }
+        if (ass_render_event(&priv->state, event, priv->eimg + cnt))
+            cnt++;
+    }
+    return cnt;
+}
+
+
 /**
  * \brief render a frame
  * \param priv library handle
@@ -3377,22 +3540,7 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         return NULL;
     }
 
-    // render events separately
-    int cnt = 0;
-    for (int i = 0; i < track->n_events; i++) {
-        ASS_Event *event = track->events + i;
-        if ((event->Start <= now)
-            && (now < (event->Start + event->Duration))) {
-            if (cnt >= priv->eimg_size) {
-                priv->eimg_size += 100;
-                priv->eimg =
-                    realloc(priv->eimg,
-                            priv->eimg_size * sizeof(EventImages));
-            }
-            if (ass_render_event(&priv->state, event, priv->eimg + cnt))
-                cnt++;
-        }
-    }
+    int cnt = render_events_at(priv, track, now);
 
     // sort by layer
     if (cnt > 0)
