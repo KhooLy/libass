@@ -308,6 +308,8 @@ typedef struct {
     size_t composite_max_size;
 } CacheStore;
 
+typedef struct render_priv RenderPriv;
+
 struct ass_renderer {
     ASS_Library *library;
     FT_Library ftlibrary;
@@ -315,6 +317,10 @@ struct ass_renderer {
     size_t num_emfonts;
     ASS_Settings settings;
     int render_id;
+    bool stateless;
+    bool history_dependent;
+    RenderPriv *stateless_rp;
+    int stateless_rp_n;
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
@@ -354,10 +360,10 @@ struct ass_renderer {
     ASS_Style user_override_style;
 };
 
-typedef struct render_priv {
+struct render_priv {
     int top, height, left, width;
     int render_id;
-} RenderPriv;
+};
 
 typedef struct {
     int x0;

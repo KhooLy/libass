@@ -195,6 +195,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     if (render_priv->ftlibrary)
         FT_Done_FreeType(render_priv->ftlibrary);
     free(render_priv->eimg);
+    free(render_priv->stateless_rp);
     free_event_index(render_priv);
 
     render_context_done(&render_priv->state);
@@ -3119,6 +3120,26 @@ static int cmp_event_layer(const void *p1, const void *p2)
 static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
                                        ASS_Event *event)
 {
+    if (render_priv->stateless) {
+        ASS_Track *track = render_priv->track;
+        int idx = event - track->events;
+        if (idx >= render_priv->stateless_rp_n) {
+            int n = FFMAX(track->n_events, idx + 1);
+            RenderPriv *rp = realloc(render_priv->stateless_rp, n * sizeof(*rp));
+            if (!rp)
+                return NULL;
+            memset(rp + render_priv->stateless_rp_n, 0,
+                   (n - render_priv->stateless_rp_n) * sizeof(*rp));
+            render_priv->stateless_rp = rp;
+            render_priv->stateless_rp_n = n;
+        }
+        RenderPriv *p = render_priv->stateless_rp + idx;
+        if (p->render_id != render_priv->render_id) {
+            memset(p, 0, sizeof(*p));
+            p->render_id = render_priv->render_id;
+        }
+        return p;
+    }
     if (!event->render_priv) {
         event->render_priv = calloc(1, sizeof(ASS_RenderPriv));
         if (!event->render_priv)
@@ -3219,6 +3240,7 @@ fix_collisions(ASS_Renderer *render_priv, EventImages *imgs, int cnt)
         // zero-area events are therefore effectively fixed as well
         if (!imgs[i].detect_collisions || !imgs[i].height  || !imgs[i].width)
             continue;
+        render_priv->history_dependent = true;
         priv = get_render_priv(render_priv, imgs[i].event);
         if (priv && priv->height > 0) { // it's a fixed event
             Rect s;
@@ -3540,6 +3562,10 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         return NULL;
     }
 
+    if (priv->stateless) {
+        priv->render_id++;
+        priv->history_dependent = false;
+    }
     int cnt = render_events_at(priv, track, now);
 
     // sort by layer

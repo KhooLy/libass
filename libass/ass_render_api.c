@@ -213,3 +213,13 @@ ass_create_font_provider(ASS_Renderer *priv, ASS_FontProviderFuncs *funcs,
 {
     return ass_font_provider_new(priv->fontselect, funcs, data);
 }
+
+void ass_set_stateless(ASS_Renderer *priv, int stateless)
+{
+    priv->stateless = stateless;
+}
+
+int ass_frame_history_dependent(ASS_Renderer *priv)
+{
+    return priv->history_dependent;
+}

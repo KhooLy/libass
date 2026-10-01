@@ -606,6 +606,9 @@ int ass_fonts_update(ASS_Renderer *priv);
 void ass_set_cache_limits(ASS_Renderer *priv, int glyph_max,
                           int bitmap_max_size);
 
+void ass_set_stateless(ASS_Renderer *priv, int stateless);
+int ass_frame_history_dependent(ASS_Renderer *priv);
+
 /**
  * \brief Render a frame, producing a list of ASS_Image.
  * \param priv renderer handle
