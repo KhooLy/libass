@@ -181,6 +181,12 @@ static inline long ass_lrint(double x)
     // Unlike GCC and Clang, Visual C++ can't inline lrint() without -fp:fast, so
     // we provide our own implementation
     return _mm_cvtsd_si32(_mm_set_sd(x));
+#elif defined(__arm__) && defined(__VFP_FP__) && !defined(__SOFTFP__) || defined(__arm__) && defined(__ARM_FP)
+    float r;
+    __asm__("vcvtr.s32.f64 %0, %P1" : "=t"(r) : "w"(x));
+    int32_t i;
+    memcpy(&i, &r, sizeof(i));
+    return i;
 #else
     return lrint(x);
 #endif

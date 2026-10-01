@@ -381,11 +381,21 @@ Cache *ass_cache_create(const CacheDesc *desc)
 // creating one if it does not already exist.
 // The returned item is guaranteed to be valid until the next ass_cache_cut call;
 // to extend its lifetime further, call ass_cache_inc_ref().
+static inline unsigned hash_bucket(ass_hashcode h, unsigned buckets)
+{
+    if (buckets != 0xFFFF)
+        return h % buckets;
+    unsigned s = (h & 0xFFFF) + ((h >> 16) & 0xFFFF) + ((h >> 32) & 0xFFFF) + (h >> 48);
+    s = (s & 0xFFFF) + (s >> 16);
+    s = (s & 0xFFFF) + (s >> 16);
+    return s == 0xFFFF ? 0 : s;
+}
+
 void *ass_cache_get(Cache *cache, void *key, void *priv)
 {
     const CacheDesc *desc = cache->desc;
     size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
-    unsigned bucket = desc->hash_func(key, ASS_HASH_INIT) % cache->buckets;
+    unsigned bucket = hash_bucket(desc->hash_func(key, ASS_HASH_INIT), cache->buckets);
     CacheItem *item = cache->map[bucket];
     while (item) {
         if (desc->compare_func(key, (char *) item + key_offs)) {
