@@ -133,6 +133,19 @@ ass_strtod(
         sign = 0;
     }
 
+    {
+        const char *q = p;
+        unsigned long long v = 0;
+        while (*q >= '0' && *q <= '9' && q - p < 15)
+            v = v * 10 + (*q++ - '0');
+        if (q != p && *q != '.' && *q != 'e' && *q != 'E' &&
+            !(*q >= '0' && *q <= '9')) {
+            if (endPtr != NULL)
+                *endPtr = (char *) q;
+            return sign ? -(double) v : (double) v;
+        }
+    }
+
     /*
      * Count the number of digits in the mantissa (including the decimal
      * point), and also locate the decimal point.

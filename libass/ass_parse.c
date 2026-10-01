@@ -65,9 +65,17 @@ static inline void push_arg(struct arg *args, int *nargs, char *start, char *end
  * \brief Check if starting part of (*p) matches sample.
  * If true, shift p to the first symbol after the matching part.
  */
-static inline int mystrcmp(char **p, const char *sample)
+#if defined(__GNUC__)
+#define FORCE_INLINE __attribute__((always_inline))
+#else
+#define FORCE_INLINE
+#endif
+
+static inline FORCE_INLINE int mystrcmp(char **p, const char *sample)
 {
     char *p2;
+    if (**p != *sample)
+        return 0;
     for (p2 = *p; *sample != 0 && *p2 == *sample; p2++, sample++)
         ;
     if (*sample == 0) {
