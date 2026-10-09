@@ -197,6 +197,13 @@ BitmapEngine ass_bitmap_engine_init(unsigned mask)
 #endif
 
     ALL_FUNCTIONS(4, 16, c)
+#if ARCH_ARM_NEON
+    if (!(mask & ASS_FLAG_WIDE_STRIPE)) {
+        BLUR_PROTOTYPES(16, neon)
+        BLUR_FUNCTIONS(4, 16, neon)
+        return engine;
+    }
+#endif
     if (mask & ASS_FLAG_WIDE_STRIPE) {
         BLUR_FUNCTIONS(5, 32, c)
     }

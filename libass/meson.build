@@ -82,6 +82,10 @@ if coretext
     libass_src += src_coretext
 endif
 
+if conf.get('ARCH_ARM_NEON', 0) == 1
+    libass_src += files('arm/blur.c')
+endif
+
 if enable_asm
     asm_sources = []
     if generic_cpu_family == 'x86'

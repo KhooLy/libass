@@ -323,6 +323,8 @@ if not asm_option.disabled()
         if host_system == 'darwin'
             asm_args += '-DPREFIX'
         endif
+    elif cpu_family == 'arm' and cc.get_define('__ARM_NEON') != ''
+        conf.set('ARCH_ARM_NEON', 1)
     else
         warning(
             'Assembly optimizations are not yet supported for the "@0@" architecture; disabling.'.format(
