@@ -198,6 +198,13 @@ BitmapEngine ass_bitmap_engine_init(unsigned mask)
 
     ALL_FUNCTIONS(4, 16, c)
 #if ARCH_ARM_NEON
+    if (!(mask & ASS_FLAG_LARGE_TILES)) {
+        RASTERIZER_PROTOTYPES(16, neon)
+        engine.fill_solid = ass_fill_solid_tile16_neon;
+        engine.fill_halfplane = ass_fill_halfplane_tile16_neon;
+        engine.fill_generic = ass_fill_generic_tile16_neon;
+        engine.merge = ass_merge_tile16_neon;
+    }
     if (!(mask & ASS_FLAG_WIDE_STRIPE)) {
         BLUR_PROTOTYPES(16, neon)
         BLUR_FUNCTIONS(4, 16, neon)

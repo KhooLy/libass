@@ -83,7 +83,7 @@ if coretext
 endif
 
 if conf.get('ARCH_ARM_NEON', 0) == 1
-    libass_src += files('arm/blur.c')
+    libass_src += files('arm/blur.c', 'arm/rasterizer.c')
 endif
 
 if enable_asm
