@@ -43,6 +43,7 @@
 #include "ass_fontselect.h"
 #include "ass_fontconfig.h"
 #include "ass_coretext.h"
+#include "ass_android.h"
 #include "ass_directwrite.h"
 #include "ass_font.h"
 #include "ass_string.h"
@@ -1052,6 +1053,9 @@ struct font_constructors font_constructors[] = {
         " (without GDI)"
 #endif
     },
+#endif
+#ifdef __ANDROID__
+    { ASS_FONTPROVIDER_ANDROID,         &ass_android_add_provider,      "android"},
 #endif
 #ifdef CONFIG_FONTCONFIG
     { ASS_FONTPROVIDER_FONTCONFIG,      &ass_fontconfig_add_provider,   "fontconfig"},

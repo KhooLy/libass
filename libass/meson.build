@@ -81,6 +81,9 @@ endif
 if coretext
     libass_src += src_coretext
 endif
+if host_machine.system() == 'android'
+    libass_src += files('ass_android.c')
+endif
 
 if conf.get('ARCH_ARM_NEON', 0) == 1
     libass_src += files('arm/blur.c', 'arm/rasterizer.c')
