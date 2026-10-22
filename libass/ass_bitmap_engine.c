@@ -94,7 +94,7 @@
 // implements both directions; the x86 SIMD horizontal blur only covers radius
 // >= 4, so on x86 the narrow *horizontal* kernels fall back to the C versions
 // (always built). The vertical SIMD kernels are available for all radii.
-#if CONFIG_ASM && ARCH_X86
+#if (CONFIG_ASM && ARCH_X86) || ARCH_ARM_NEON
 #define PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
     engine.blur_horz[0] = ass_blur1_horz ## alignment ## _c; \
     engine.blur_horz[1] = ass_blur2_horz ## alignment ## _c; \
@@ -106,10 +106,17 @@
     engine.blur_horz[2] = ass_blur3_horz ## alignment ## _ ## suffix;
 #endif
 
+#if ARCH_ARM_NEON
+#define PARAM_BLUR_NARROW_VERT(alignment, suffix) \
+    engine.blur_vert[0] = ass_blur1_vert ## alignment ## _c; \
+    engine.blur_vert[1] = ass_blur2_vert ## alignment ## _c; \
+    engine.blur_vert[2] = ass_blur3_vert ## alignment ## _c;
+#else
 #define PARAM_BLUR_NARROW_VERT(alignment, suffix) \
     engine.blur_vert[0] = ass_blur1_vert ## alignment ## _ ## suffix; \
     engine.blur_vert[1] = ass_blur2_vert ## alignment ## _ ## suffix; \
     engine.blur_vert[2] = ass_blur3_vert ## alignment ## _ ## suffix;
+#endif
 
 #define PARAM_BLUR_NARROW(alignment, suffix) \
     PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
