@@ -31,16 +31,40 @@
 
 #elif defined(CREATE_HASH_FUNCTIONS)
 #undef CREATE_HASH_FUNCTIONS
+// Coalesce consecutive fixed-width (GENERIC/VECTOR) members into a single
+// ass_hash_buf() call over their contiguous byte range. wyhash() pays a fixed
+// setup cost plus ~2 128-bit multiplies per call, so hashing e.g. all 40 bytes
+// of BitmapHashKey at once is far cheaper than the previous 5-9 per-member
+// mixes. A STRING member (variable length, indirect storage) flushes the
+// pending run; END flushes any trailing run.
+//
+// SAFETY: the coalesced range spans exactly [first_member, last_member_end);
+// it never extends to sizeof(struct), so trailing padding is never hashed.
+// All key structs are verified to have NO internal padding between adjacent
+// fixed-width members (every adjacent pair is byte-contiguous), so no
+// uninitialized padding bytes are ever included -> equal keys still hash equal.
 #define START(funcname, structname) \
     static ass_hashcode funcname##_hash(void *buf, ass_hashcode hval) \
     { \
-        struct structname *p = buf;
+        struct structname *p = buf; \
+        const char *run_beg = NULL, *run_end = NULL;
+#define ASS_HASH_FLUSH_RUN \
+        if (run_beg) { \
+            hval = ass_hash_buf(run_beg, run_end - run_beg, hval); \
+            run_beg = run_end = NULL; \
+        }
+#define ASS_HASH_ADD_RANGE(beg, end) \
+        if (!run_beg) run_beg = (const char *) (beg); \
+        run_end = (const char *) (end);
 #define GENERIC(type, member) \
-        hval = ass_hash_buf(&p->member, sizeof(p->member), hval);
+        ASS_HASH_ADD_RANGE(&p->member, (&p->member) + 1)
 #define STRING(member) \
+        ASS_HASH_FLUSH_RUN \
         hval = ass_hash_buf(p->member.str, p->member.len, hval);
-#define VECTOR(member) GENERIC(, member.x); GENERIC(, member.y);
+#define VECTOR(member) \
+        ASS_HASH_ADD_RANGE(&p->member, (&p->member) + 1)
 #define END(typedefname) \
+        ASS_HASH_FLUSH_RUN \
         return hval; \
     }
 
@@ -136,3 +160,5 @@ END(BitmapRef)
 #undef STRING
 #undef VECTOR
 #undef END
+#undef ASS_HASH_FLUSH_RUN
+#undef ASS_HASH_ADD_RANGE

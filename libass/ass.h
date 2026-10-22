@@ -287,6 +287,63 @@ typedef enum {
      */
     ASS_FEATURE_WRAP_UNICODE,
 
+    /**
+     * Use faster, approximate Gaussian blur kernels.
+     *
+     * The default blur always uses a kernel of at least radius 4 (a 9-tap
+     * filter), which is far wider than necessary for the small blur radii that
+     * dominate typical subtitles and signs. When this feature is enabled, the
+     * blur picks a kernel sized to the actual standard deviation, refitting the
+     * filter coefficients to the smaller radius. This is noticeably faster for
+     * blur-heavy content (e.g. per-frame re-blurred motion-tracked signs) at
+     * the cost of a small, sub-perceptual change to the blurred output
+     * (bounded well within the renderer's own blur precision budget).
+     *
+     * This is incompatible with VSFilter and disabled by default.
+     */
+    ASS_FEATURE_FAST_BLUR,
+
+    /**
+     * Reuse blurred bitmap/composite cache entries across tiny subpixel
+     * motion deltas.
+     *
+     * Motion-tracked signs are often authored as many frame-sized events whose
+     * vector geometry, blur and colors are effectively stable, but whose
+     * position/origin values jitter by subpixel amounts. Normally libass keeps
+     * a separate transformed bitmap for each subpixel phase. When this feature
+     * is enabled, blurred glyph and drawing bitmap keys are snapped from the
+     * usual 1/8-pixel phase grid to a 1/4-pixel phase grid, allowing
+     * visually-near-identical frames to reuse more transformed and blurred
+     * work.
+     *
+     * This is incompatible with VSFilter and disabled by default.
+     */
+    ASS_FEATURE_MOTION_CACHE,
+
+    /**
+     * Retain cached static subtitle layouts across inactive periods.
+     *
+     * The parse/shape/layout pipeline (text parsing, HarfBuzz/FriBidi shaping,
+     * glyph retrieval, wrapping, reordering, alignment, bounding box and
+     * rotation setup) is a pure function of the event and the renderer
+     * configuration for events that contain no time-dependent overrides. Yet it
+     * is re-run identically on every frame an event is visible, which for
+     * typical dialogue and signs is the dominant cost and almost entirely
+     * redundant. The renderer normally snapshots that laid-out state while an
+     * event remains active on consecutive frames, then promptly releases it.
+     * Enabling this feature retains snapshots for inactive events too, which
+     * avoids rebuilding them after seeks or when replaying the same track at the
+     * cost of potentially retaining substantially more memory.
+     *
+     * Only events with no time-dependent tags (\t, \move, \fad/\fade,
+     * \k/\K/\kf/\ko) and no scrolling/banner transition effect are cached;
+     * everything else falls back to the normal per-frame path. The cached and
+     * non-cached paths produce byte-identical output.
+     *
+     * This is a performance-only extension and disabled by default.
+     */
+    ASS_FEATURE_CACHE_LAYOUT,
+
     // New enum values can be added here in new ABI-compatible library releases.
 } ASS_Feature;
 
@@ -400,6 +457,20 @@ void ass_renderer_done(ASS_Renderer *priv);
  * NOTE: frame size must be configured before an ASS_Renderer can be used.
  */
 void ass_set_frame_size(ASS_Renderer *priv, int w, int h);
+
+/**
+ * \brief Set the number of threads to use during rendering. Default is 0,
+ * meaning the number of available logical cores if known, otherwise 1.
+ * \param priv renderer handle
+ * \param threads number of threads
+ *
+ * \return number of threads that will be used (if 0 is passed, the autodetected
+ * count will be returned), or 0 if libass was built without threading support.
+ *
+ * Calling this function requires the log callback of the associated ASS_Library
+ * to be thread-safe, and opts out of internal locking around log calls.
+ */
+unsigned ass_set_threads(ASS_Renderer *priv, unsigned threads);
 
 /**
  * \brief Set the source image size in pixels.

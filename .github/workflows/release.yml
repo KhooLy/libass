@@ -1,0 +1,168 @@
+name: Release Builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build. Leave empty to use the selected ref.
+        required: false
+        type: string
+      publish_release:
+        description: Publish artifacts to the matching GitHub release. Requires a tag ref.
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android static libraries
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_API: '21'
+      ANDROID_NDK_VERSION: '28.1.13356709'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config nasm gperf python3-pip zip xz-utils
+          python3 -m pip install --user --break-system-packages 'meson>=1.6.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Locate Android NDK
+        run: |
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ "$(basename "$ANDROID_NDK_HOME")" = "$ANDROID_NDK_VERSION" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -n "${ANDROID_NDK_ROOT:-}" ] && [ "$(basename "$ANDROID_NDK_ROOT")" = "$ANDROID_NDK_VERSION" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            echo "ANDROID_HOME is not set and no Android NDK was found" >&2
+            exit 1
+          fi
+
+          sdkmanager_bin="$(command -v sdkmanager || true)"
+          if [ -z "$sdkmanager_bin" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            sdkmanager_bin="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [ -z "$sdkmanager_bin" ]; then
+            echo "sdkmanager was not found" >&2
+            exit 1
+          fi
+
+          yes | "$sdkmanager_bin" --licenses >/dev/null
+          "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build Android package
+        run: ./.github/scripts/build-android-release.sh
+
+      - name: Upload Android package
+        uses: actions/upload-artifact@v4
+        with:
+          name: libass-android
+          path: dist/libass-android-*.zip
+          if-no-files-found: error
+
+  apple:
+    name: Apple XCFramework
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode.app ]; then
+            sudo xcode-select -s /Applications/Xcode.app
+          fi
+          xcodebuild -version
+
+      - name: Install build tools
+        run: brew install meson ninja pkg-config nasm
+
+      - name: Build XCFramework package
+        run: ./.github/scripts/build-apple-xcframework.sh
+
+      - name: Upload XCFramework package
+        uses: actions/upload-artifact@v4
+        with:
+          name: libass-apple-xcframework
+          path: dist/libass-apple-xcframework-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - android
+      - apple
+    if: ${{ github.event_name == 'push' || github.event.inputs.publish_release == 'true' }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Download packages
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ github.event.inputs.ref }}
+        run: |
+          if [ -n "$REQUESTED_REF" ]; then
+            tag="${REQUESTED_REF#refs/tags/}"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+
+          if ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "Release publishing requires a tag ref, got '$tag'." >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip --clobber
+          else
+            gh release create "$tag" dist/*.zip --title "$tag" --generate-notes
+          fi

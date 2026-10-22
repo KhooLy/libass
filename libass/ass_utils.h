@@ -55,6 +55,18 @@
 
 #define FEATURE_MASK(feat) (((uint32_t) 1) << (feat))
 
+#if DEBUG_LEVEL >= 1
+    #define ass_assert1(x) assert(x)
+#else
+    #define ass_assert1(x) (void)0
+#endif
+
+#if DEBUG_LEVEL >= 2
+    #define ass_assert2(x) assert(x)
+#else
+    #define ass_assert2(x) (void)0
+#endif
+
 #if DEBUG_LEVEL >= 3
     #define ASSUME(x) assert(x)
 #elif __has_builtin(__builtin_assume)
@@ -263,7 +275,93 @@ static inline int mystrtod(char **p, double *res)
 static inline int mystrtoi32(char **p, int base, int32_t *res)
 {
     char *start = *p;
-    long long temp_res = strtoll(*p, p, base);
+
+    // Locale-independent fast path for the bases libass uses (10 and 16).
+    // It reproduces strtoll()'s contract exactly: C-locale leading whitespace,
+    // optional sign, optional "0x"/"0X" prefix for base 16, digit accumulation
+    // with overflow clamped to LLONG_MIN/MAX, and *p left at the first
+    // unconsumed char (or unchanged if no digits).
+    //
+    // IMPORTANT: on macOS/BSD strtoll() skips *locale-dependent* leading
+    // whitespace (LC_CTYPE isspace), so under a UTF-8 locale it skips high
+    // bytes such as 0xa0 (NBSP) that the fixed C-locale set below would not.
+    // Such bytes can reach this function because the override-argument
+    // tokenizer (skip_spaces/rskip_spaces) strips only ASCII space/tab. To stay
+    // byte-identical with the host strtoll, if any byte >= 0x80 appears in the
+    // leading-whitespace region we delegate the whole call to strtoll. Normal
+    // numeric arguments never start with a high byte, so the fast path is used
+    // in practice.
+    for (unsigned char *t = (unsigned char *) start; ; ++t) {
+        unsigned char c = *t;
+        if (c >= 0x80) {
+            long long v = strtoll(start, p, base);
+            *res = FFMINMAX(v, INT32_MIN, INT32_MAX);
+            return *p != start;
+        }
+        if (!(c == ' '  || c == '\t' || c == '\n' ||
+              c == '\v' || c == '\f' || c == '\r'))
+            break;
+    }
+
+    char *s = start;
+    while (*s == ' '  || *s == '\t' || *s == '\n' ||
+           *s == '\v' || *s == '\f' || *s == '\r')
+        ++s;
+
+    bool neg = false;
+    if (*s == '+') {
+        ++s;
+    } else if (*s == '-') {
+        neg = true;
+        ++s;
+    }
+
+    if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        unsigned char d = (unsigned char) s[2];
+        if ((d >= '0' && d <= '9') || (d >= 'a' && d <= 'f') ||
+            (d >= 'A' && d <= 'F'))
+            s += 2;
+    }
+
+    unsigned long long cutoff = neg ? (unsigned long long) LLONG_MAX + 1ull
+                                    : (unsigned long long) LLONG_MAX;
+    int cutlim = cutoff % (unsigned) base;
+    cutoff /= (unsigned) base;
+
+    unsigned long long acc = 0;
+    int any = 0;
+    for (;; ++s) {
+        unsigned char c = (unsigned char) *s;
+        int dig;
+        if (c >= '0' && c <= '9')
+            dig = c - '0';
+        else if (c >= 'a' && c <= 'z')
+            dig = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z')
+            dig = c - 'A' + 10;
+        else
+            break;
+        if (dig >= base)
+            break;
+        if (any < 0)
+            continue;
+        if (acc > cutoff || (acc == cutoff && dig > cutlim)) {
+            any = -1;
+        } else {
+            any = 1;
+            acc = acc * (unsigned) base + dig;
+        }
+    }
+
+    long long temp_res;
+    if (any < 0)
+        temp_res = neg ? LLONG_MIN : LLONG_MAX;
+    else if (any > 0)
+        temp_res = neg ? -(long long) acc : (long long) acc;
+    else
+        temp_res = 0;
+
+    *p = any ? s : start;
     *res = FFMINMAX(temp_res, INT32_MIN, INT32_MAX);
     return *p != start;
 }

@@ -452,41 +452,48 @@ static void polyline_split_horz(const struct segment *src, const size_t n_src[2]
                                 struct segment *dst1, size_t n_dst1[2],
                                 int winding[2], int32_t x)
 {
-    const struct segment *cmp = src + n_src[0];
-    const struct segment *end = cmp + n_src[1];
-    n_dst0[0] = n_dst0[1] = 0;
-    n_dst1[0] = n_dst1[1] = 0;
-    for (; src != end; src++) {
-        int group = src < cmp ? 0 : 1;
-
-        int delta = 0;
-        if (!src->y_min && (src->flags & SEGFLAG_EXACT_TOP))
-            delta = src->a < 0 ? 1 : -1;
-        if (segment_check_right(src, x)) {
-            winding[group] += delta;
-            if (src->x_min >= x)
+    // Process the two contiguous input groups as separate loops so the
+    // winding/output counters stay in registers (the [group] array params
+    // otherwise force reloads via possible aliasing) and the per-segment
+    // src<cmp group test disappears. Bit-identical to the single-loop form.
+    const struct segment *grp[3] = { src, src + n_src[0], src + n_src[0] + n_src[1] };
+    for (int group = 0; group < 2; group++) {
+        const struct segment *s = grp[group], *gend = grp[group + 1];
+        int w = winding[group];
+        size_t c0 = 0, c1 = 0;
+        for (; s != gend; s++) {
+            int delta = 0;
+            if (!s->y_min && (s->flags & SEGFLAG_EXACT_TOP))
+                delta = s->a < 0 ? 1 : -1;
+            if (segment_check_right(s, x)) {
+                w += delta;
+                if (s->x_min >= x)
+                    continue;
+                *dst0 = *s;
+                dst0->x_max = FFMIN(dst0->x_max, x);
+                c0++;
+                dst0++;
                 continue;
-            *dst0 = *src;
-            dst0->x_max = FFMIN(dst0->x_max, x);
-            n_dst0[group]++;
+            }
+            if (segment_check_left(s, x)) {
+                *dst1 = *s;
+                segment_move_x(dst1, x);
+                c1++;
+                dst1++;
+                continue;
+            }
+            if (s->flags & SEGFLAG_UL_DR)
+                w += delta;
+            *dst0 = *s;
+            segment_split_horz(dst0, dst1, x);
+            c0++;
             dst0++;
-            continue;
-        }
-        if (segment_check_left(src, x)) {
-            *dst1 = *src;
-            segment_move_x(dst1, x);
-            n_dst1[group]++;
+            c1++;
             dst1++;
-            continue;
         }
-        if (src->flags & SEGFLAG_UL_DR)
-            winding[group] += delta;
-        *dst0 = *src;
-        segment_split_horz(dst0, dst1, x);
-        n_dst0[group]++;
-        dst0++;
-        n_dst1[group]++;
-        dst1++;
+        winding[group] = w;
+        n_dst0[group] = c0;
+        n_dst1[group] = c1;
     }
 }
 
@@ -498,41 +505,44 @@ static void polyline_split_vert(const struct segment *src, const size_t n_src[2]
                                 struct segment *dst1, size_t n_dst1[2],
                                 int winding[2], int32_t y)
 {
-    const struct segment *cmp = src + n_src[0];
-    const struct segment *end = cmp + n_src[1];
-    n_dst0[0] = n_dst0[1] = 0;
-    n_dst1[0] = n_dst1[1] = 0;
-    for (; src != end; src++) {
-        int group = src < cmp ? 0 : 1;
-
-        int delta = 0;
-        if (!src->x_min && (src->flags & SEGFLAG_EXACT_LEFT))
-            delta = src->b < 0 ? 1 : -1;
-        if (segment_check_bottom(src, y)) {
-            winding[group] += delta;
-            if (src->y_min >= y)
+    const struct segment *grp[3] = { src, src + n_src[0], src + n_src[0] + n_src[1] };
+    for (int group = 0; group < 2; group++) {
+        const struct segment *s = grp[group], *gend = grp[group + 1];
+        int w = winding[group];
+        size_t c0 = 0, c1 = 0;
+        for (; s != gend; s++) {
+            int delta = 0;
+            if (!s->x_min && (s->flags & SEGFLAG_EXACT_LEFT))
+                delta = s->b < 0 ? 1 : -1;
+            if (segment_check_bottom(s, y)) {
+                w += delta;
+                if (s->y_min >= y)
+                    continue;
+                *dst0 = *s;
+                dst0->y_max = dst0->y_max < y ? dst0->y_max : y;
+                c0++;
+                dst0++;
                 continue;
-            *dst0 = *src;
-            dst0->y_max = dst0->y_max < y ? dst0->y_max : y;
-            n_dst0[group]++;
+            }
+            if (segment_check_top(s, y)) {
+                *dst1 = *s;
+                segment_move_y(dst1, y);
+                c1++;
+                dst1++;
+                continue;
+            }
+            if (s->flags & SEGFLAG_UL_DR)
+                w += delta;
+            *dst0 = *s;
+            segment_split_vert(dst0, dst1, y);
+            c0++;
             dst0++;
-            continue;
-        }
-        if (segment_check_top(src, y)) {
-            *dst1 = *src;
-            segment_move_y(dst1, y);
-            n_dst1[group]++;
+            c1++;
             dst1++;
-            continue;
         }
-        if (src->flags & SEGFLAG_UL_DR)
-            winding[group] += delta;
-        *dst0 = *src;
-        segment_split_vert(dst0, dst1, y);
-        n_dst0[group]++;
-        dst0++;
-        n_dst1[group]++;
-        dst1++;
+        winding[group] = w;
+        n_dst0[group] = c0;
+        n_dst1[group] = c1;
     }
 }
 

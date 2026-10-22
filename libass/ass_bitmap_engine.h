@@ -84,7 +84,8 @@ typedef struct {
     Convert16to8Func *stripe_pack;
     FilterFunc *shrink_horz, *shrink_vert;
     FilterFunc *expand_horz, *expand_vert;
-    ParamFilterFunc *blur_horz[5], *blur_vert[5];
+    // indexed by radius-1, i.e. blur_horz[0] is the radius-1 (3-tap) kernel
+    ParamFilterFunc *blur_horz[8], *blur_vert[8];
 } BitmapEngine;
 
 enum {

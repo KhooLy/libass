@@ -299,6 +299,48 @@ static inline void SUFFIX(blur_vert)(int16_t *restrict dst, const int16_t *restr
     }
 }
 
+void SUFFIX(ass_blur1_horz)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 1);
+}
+
+void SUFFIX(ass_blur1_vert)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 1);
+}
+
+void SUFFIX(ass_blur2_horz)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 2);
+}
+
+void SUFFIX(ass_blur2_vert)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 2);
+}
+
+void SUFFIX(ass_blur3_horz)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 3);
+}
+
+void SUFFIX(ass_blur3_vert)(int16_t *restrict dst, const int16_t *restrict src,
+                            size_t src_width, size_t src_height,
+                            const int16_t *restrict param)
+{
+    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 3);
+}
+
 void SUFFIX(ass_blur4_horz)(int16_t *restrict dst, const int16_t *restrict src,
                             size_t src_width, size_t src_height,
                             const int16_t *restrict param)

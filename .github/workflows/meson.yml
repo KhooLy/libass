@@ -202,10 +202,27 @@ jobs:
 
       - name: install deps
         run: |
-          # muon's style lint uses git
-          apk add nasm ${{ matrix.cc }} musl-dev muon samurai \
+          # muon's style lint uses git. muon itself is built from source below
+          # instead of installed via apk: Alpine's packaged muon can lag behind
+          # edge's pkgconf soname bumps (e.g. muon needing libpkgconf.so.7 while
+          # edge already ships libpkgconf.so.8), which breaks `apk add muon`.
+          apk add nasm ${{ matrix.cc }} musl-dev samurai pkgconf git \
                   freetype-dev fribidi-dev harfbuzz-dev \
-                  fontconfig-dev libpng-dev git
+                  fontconfig-dev libpng-dev
+
+      - name: build muon
+        run: |
+          # Build muon from source and install it to /usr/local/bin. Without
+          # -Dlibpkgconf, muon shells out to the pkg-config binary at runtime and
+          # carries no libpkgconf.so.N link dependency, so it is immune to edge's
+          # pkgconf soname churn.
+          git clone --depth 1 --branch 0.6.0 \
+              https://github.com/muon-build/muon.git /tmp/muon
+          cd /tmp/muon
+          ./bootstrap.sh build
+          build/muon-bootstrap setup build
+          build/muon-bootstrap -C build samu
+          build/muon -C build install
 
       - name: checkout code
         uses: actions/checkout@v6
@@ -213,7 +230,7 @@ jobs:
       - name: configure
         run: |
           muon version
-          muon setup -Dtest=enabled build
+          muon setup -Dtest=enabled -Dthreads=disabled build
 
       - name: build
         run: |

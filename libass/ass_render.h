@@ -20,6 +20,8 @@
 #ifndef LIBASS_RENDER_H
 #define LIBASS_RENDER_H
 
+#include "ass_compat.h"
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <fribidi.h>
@@ -39,6 +41,7 @@
 #include "ass_drawing.h"
 #include "ass_bitmap.h"
 #include "ass_rasterizer.h"
+#include "ass_threading.h"
 
 #define GLYPH_CACHE_MAX 10000
 #define MEGABYTE (1024 * 1024)
@@ -49,12 +52,35 @@
 #define PARSED_FADE (1<<0)
 #define PARSED_A    (1<<1)
 
+typedef struct image_pool ImagePool;
+
+// Ref-counted read-only pixel buffer shared by cached emitted images (opaque
+// here; defined in ass_render.c). Lets the layout-cache clone owned-buffer
+// images (vector clip / opaque-box background) without a per-clone pixel copy.
+typedef struct shared_buffer SharedBuffer;
+
 typedef struct {
     ASS_Image result;
     CompositeHashValue *source;
-    unsigned char *buffer;
+    unsigned char *buffer;      // owned aligned buffer, ass_aligned_free'd on free
+    SharedBuffer *shared;       // if set: shared read-only master, unref'd on free (buffer NULL)
     size_t ref_count;
+    ImagePool *pool;            // owning recycler, or NULL if heap-allocated
 } ASS_ImagePriv;
+
+// Per-renderer free list that recycles ASS_ImagePriv shells across frames.
+// Animated/sign-heavy subtitles emit hundreds-to-thousands of images per frame,
+// each previously a separate malloc()/free(); recycling avoids that churn. The
+// pool outlives the renderer if the caller still holds an image list: it is
+// freed only once the renderer is gone AND no checked-out images remain.
+struct image_pool {
+    ASS_ImagePriv *free_list;   // recycled shells, linked via result.next
+    size_t live;                // images currently checked out (not recycled)
+    bool renderer_alive;
+#if ENABLE_THREADS
+    pthread_mutex_t mutex;
+#endif
+};
 
 typedef struct {
     int frame_width;
@@ -77,6 +103,10 @@ typedef struct {
 
     char *default_font;
     char *default_family;
+
+#if ENABLE_THREADS
+    int threads;
+#endif
 } ASS_Settings;
 
 // a rendered event
@@ -111,6 +141,7 @@ typedef struct {
 
     size_t bitmap_count, max_bitmap_count;
     BitmapRef *bitmaps;
+    bool reuse_bitmaps;
 
     int x, y;
     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps
@@ -211,6 +242,14 @@ struct render_context {
     TextInfo text_info;
     ASS_Shaper *shaper;
     RasterizerData rasterizer;
+    CacheClient *cache_client;
+    ImagePool *image_pool;
+
+    // Set by render_and_combine_glyphs/get_bitmap_glyph when an allocation
+    // (cache creation) fails mid-render, so its best-effort partial result is
+    // not frozen into the combined-bitmap snapshot (which would render the same
+    // dropped glyphs forever). Reset at the start of render_and_combine_glyphs.
+    bool alloc_error;
 
     ASS_Event *event;
     ASS_Style *style;
@@ -303,12 +342,92 @@ typedef struct {
     Cache *composite_cache;
     Cache *face_size_metrics_cache;
     Cache *metrics_cache;
+    CacheClientSet client_set;
     size_t glyph_max;
     size_t bitmap_max_size;
     size_t composite_max_size;
 } CacheStore;
 
 typedef struct render_priv RenderPriv;
+// One fully laid-out static event, cached across consecutive active frames.
+// ASS_FEATURE_CACHE_LAYOUT additionally retains inactive snapshots for seeks and
+// replays. Built once (on a layout-cache miss for an eligible event) right before
+// render_and_combine_glyphs, restored on later frames to skip the whole
+// parse/shape/layout pipeline. Owns deep copies of the laid-out glyphs (including
+// cluster next-chains) and holds an inc_ref on each
+// glyph's outline/font so they survive LRU eviction while the snapshot lives.
+// Snapshots are owned by a per-renderer intrusive registry (reg_next/reg_prev)
+// so the renderer can dec_ref/free them while its caches are still alive,
+// regardless of renderer-vs-track teardown order.
+// One cached emitted ASS_Image (post render_text + add_background) for a static
+// event, so a hit can skip render_text entirely. A clone into a fresh pool shell
+// either inc_refs the pinned composite (source-backed) or takes a ref on a shared
+// read-only master buffer (owned-buffer: vector clip / opaque-box background) —
+// no per-clone pixel copy. Because collision shift and every other post-emission
+// consumer only offset the bitmap pointer (never write pixels), and source-backed
+// composite buffers are already shared read-only across a frame, sharing an owned
+// buffer read-only is safe; the ref keeps the master alive for exactly as long as
+// any emitted image points into it (surviving snapshot free / gen bump).
+typedef struct {
+    ASS_Image result;            // template; .bitmap into composite or master, .next per clone
+    CompositeHashValue *source;  // source-backed: pinned composite; NULL if shared-buffer
+    SharedBuffer *shared;        // shared-buffer: master (snapshot holds a ref); NULL if source-backed
+} CachedImage;
+
+typedef struct layout_snapshot {
+    uint32_t gen;               // renderer layout_gen this was built under
+    uint64_t last_used_frame;   // renderer layout_frame of the most recent use
+
+    // deep-copied laid-out text_info payload
+    GlyphInfo *glyphs;          // owned cluster-head array (length entries)
+    int length;
+    LineInfo *lines;            // owned (n_lines entries)
+    int n_lines;
+    double height;
+    int border_top, border_bottom, border_x;
+
+    // Post-render_and_combine output: the combined bitmaps this event emits.
+    // Present iff the snapshot was fully built; lets a hit skip render_and_combine
+    // and jump straight to render_text. Holds an inc_ref on each group's composite
+    // `image` (which owns bm/bm_o/bm_s) so they survive LRU eviction.
+    CombinedBitmapInfo *combined_bitmaps;
+    unsigned n_bitmaps;
+
+    // Cached emitted ASS_Image list, letting a hit skip render_text/add_background
+    // too. images_cached is false when the capture failed (fall back to render_text
+    // on hits). Each cached image is either source-backed (borrows the composite
+    // pinned via combined_bitmaps) or shared-buffer (owns one SharedBuffer ref for
+    // a vector-clip / opaque-box-background master).
+    CachedImage *images;
+    unsigned n_images;
+    bool images_cached;
+
+    // RenderContext scalars read at/after the cache boundary
+    double blur_scale_x, blur_scale_y;
+    double border_scale_x, border_scale_y;
+    double screen_scale_x, screen_scale_y;
+    int border_style;
+    uint32_t back_color;        // state->c[3]
+    int fade;
+    double shadow_x, shadow_y;
+    int clip_x0, clip_y0, clip_x1, clip_y1;   // screen-space (post-transform)
+    char clip_mode;
+    char *clip_drawing_text;    // owned copy, or NULL
+    size_t clip_drawing_len;
+    int clip_drawing_scale;
+    int clip_drawing_mode;
+    char detect_collisions;
+    int alignment;
+
+    // local geometry consumed at/after the boundary
+    double device_x, device_y;
+    ASS_DRect bbox;
+
+    // registry bookkeeping
+    struct layout_snapshot *reg_next, *reg_prev;
+    struct ass_renderer *owner; // for registry-aware free from ass_free_event
+    struct render_priv *back;   // event->render_priv, to null ->layout on flush
+} LayoutSnapshot;
 
 struct ass_renderer {
     ASS_Library *library;
@@ -322,11 +441,40 @@ struct ass_renderer {
     RenderPriv *stateless_rp;
     int stateless_rp_n;
 
+    // Static-event layout cache. layout_gen is bumped on any layout-affecting
+    // change; snapshots store the gen they were built under and are invalidated
+    // on mismatch. layout_frame bounds the default cache to recently active
+    // events; ASS_FEATURE_CACHE_LAYOUT retains snapshots across inactive gaps.
+    // layout_cache is the head of an intrusive registry of all live snapshots
+    // (so they can be freed/dec_ref'd while the caches are alive). layout_seen
+    // caches the track-side layout inputs that have no setter funnel, so
+    // ass_start_frame can bump layout_gen when they change.
+    uint32_t layout_gen;
+    uint32_t layout_gen_flushed;        // last gen the registry was flushed at
+    uint64_t layout_frame;
+    LayoutSnapshot *layout_cache;
+#if ENABLE_THREADS
+    pthread_mutex_t layout_cache_mutex;
+    int layout_cache_mutex_inited;
+#endif
+    struct {
+        bool valid;
+        ASS_Track *track;
+        int play_res_x, play_res_y;
+        int layout_res_x, layout_res_y;
+        int wrap_style;
+        int kerning;
+        int scaled_border_and_shadow;
+        uint32_t feature_flags;
+        size_t num_emfonts;
+    } layout_seen;
+
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
-
     EventImages *eimg;          // temporary buffer for sorting rendered events
     int eimg_size;              // allocated buffer size
+    EventImages *eimg_sorted;   // temporary buffer for stable layer sorting
+    int eimg_sorted_size;       // allocated buffer size
 
     struct {
         ASS_Track *track;
@@ -358,11 +506,33 @@ struct ass_renderer {
     BitmapEngine engine;
 
     ASS_Style user_override_style;
+
+#if ENABLE_THREADS
+    pthread_mutex_t mutex;
+    int mutex_inited;
+    pthread_cond_t main_cond, pool_cond;
+    int main_cond_inited, pool_cond_inited;
+
+    unsigned n_threads, started_threads, active_threads;
+    pthread_t *threads;
+
+    int thread_start_failed;
+
+    int shutting_down;
+    _Atomic AtomicInt processing_eimgs, sent_eimgs, next_eimg;
+#endif
 };
 
 struct render_priv {
     int top, height, left, width;
     int render_id;
+    char *hard_overrides_text;
+    bool has_hard_overrides;
+    // Static-layout cache: memoized time-dependent-tag scan (keyed on the event's
+    // Text pointer, like hard_overrides) and the cached layout snapshot.
+    char *time_dep_text;
+    bool has_time_dep_tags;
+    LayoutSnapshot *layout;
 };
 
 typedef struct {
@@ -379,5 +549,9 @@ ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
 
 // XXX: this is actually in ass.c, includes should be fixed later on
 void ass_lazy_track_init(ASS_Library *lib, ASS_Track *track);
+
+// Release a per-event RenderPriv (frees any attached layout snapshot first).
+// Called from ass_free_event in ass.c.
+void ass_render_priv_done(RenderPriv *priv);
 
 #endif /* LIBASS_RENDER_H */

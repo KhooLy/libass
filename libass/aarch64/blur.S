@@ -424,6 +424,9 @@ function blur\n\()_horz16_neon, export=1
 endfunc
 .endm
 
+blur_horz 1
+blur_horz 2
+blur_horz 3
 blur_horz 4
 blur_horz 5
 blur_horz 6
@@ -478,6 +481,9 @@ function blur\n\()_vert16_neon, export=1
 endfunc
 .endm
 
+blur_vert 1
+blur_vert 2
+blur_vert 3
 blur_vert 4
 blur_vert 5
 blur_vert 6

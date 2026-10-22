@@ -19,6 +19,7 @@
 #include "config.h"
 #include "ass_compat.h"
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,13 +40,72 @@ struct arg {
 static inline int32_t argtoi32(struct arg arg)
 {
     int32_t value;
+    char *p = arg.start;
+    while (p < arg.end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r'))
+        p++;
+
+    bool neg = false;
+    if (p < arg.end && (*p == '+' || *p == '-'))
+        neg = *p++ == '-';
+
+    if (p < arg.end && *p >= '0' && *p <= '9') {
+        uint64_t limit = neg ? (uint64_t) INT32_MAX + 1 : INT32_MAX;
+        uint64_t acc = 0;
+        bool overflow = false;
+        do {
+            uint64_t digit = *p++ - '0';
+            if (overflow || acc > (limit - digit) / 10) {
+                overflow = true;
+            } else {
+                acc = 10 * acc + digit;
+            }
+        } while (p < arg.end && *p >= '0' && *p <= '9');
+
+        if (overflow)
+            return neg ? INT32_MIN : INT32_MAX;
+        return neg ? (int32_t) -(int64_t) acc : (int32_t) acc;
+    }
+
     mystrtoi32(&arg.start, 10, &value);
     return value;
+}
+
+static inline bool argtod_int_fast(struct arg arg, double *value)
+{
+    char *p = arg.start;
+    while (p < arg.end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r'))
+        p++;
+
+    bool neg = false;
+    if (p < arg.end && (*p == '+' || *p == '-'))
+        neg = *p++ == '-';
+
+    if (p >= arg.end || *p < '0' || *p > '9')
+        return false;
+
+    const uint64_t max_exact = (uint64_t) 1 << DBL_MANT_DIG;
+    uint64_t acc = 0;
+    do {
+        uint64_t digit = *p++ - '0';
+        if (acc > (max_exact - digit) / 10)
+            return false;
+        acc = 10 * acc + digit;
+    } while (p < arg.end && *p >= '0' && *p <= '9');
+
+    if (p < arg.end && (*p == '.' || *p == 'e' || *p == 'E'))
+        return false;
+
+    *value = neg ? -(double) acc : (double) acc;
+    return true;
 }
 
 static inline double argtod(struct arg arg)
 {
     double value;
+    if (argtod_int_fast(arg, &value))
+        return value;
     mystrtod(&arg.start, &value);
     return value;
 }
@@ -119,7 +179,7 @@ void ass_update_font(RenderContext *state)
         val = 0;                // normal
     desc.italic = val;
 
-    state->font = ass_font_new(state->renderer, &desc);
+    state->font = ass_font_new(state, &desc);
 }
 
 /**
@@ -149,6 +209,13 @@ static int32_t calc_anim_int32(uint32_t new, uint32_t old, double pwr)
  */
 static void change_color(uint32_t *var, uint32_t new, double pwr)
 {
+    if (pwr == 1.) {
+        *var = (*var & 0xFF) | (new & 0xFFFFFF00);
+        return;
+    } else if (pwr == 0.) {
+        return;
+    }
+
     uint32_t co = ass_bswap32(*var);
     uint32_t cn = ass_bswap32(new);
 
@@ -162,6 +229,13 @@ static void change_color(uint32_t *var, uint32_t new, double pwr)
 // like change_color, but for alpha component only
 static inline void change_alpha(uint32_t *var, int32_t new, double pwr)
 {
+    if (pwr == 1.) {
+        *var = (*var & 0xFFFFFF00) | (uint8_t) new;
+        return;
+    } else if (pwr == 0.) {
+        return;
+    }
+
     *var = (*var & 0xFFFFFF00) | (uint8_t)calc_anim_int32(new, _a(*var), pwr);
 }
 
@@ -236,6 +310,35 @@ static bool parse_vector_clip(RenderContext *state,
     return true;
 }
 
+static inline bool parse_simple_hex_tag(char *str, int32_t *value)
+{
+    char *p = str;
+    while (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r')
+        p++;
+    if (*p == '+' || *p == '-' || (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')))
+        return false;
+
+    int32_t result = 0;
+    while (1) {
+        int digit;
+        if (*p >= '0' && *p <= '9')
+            digit = *p - '0';
+        else if (*p >= 'a' && *p <= 'f')
+            digit = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F')
+            digit = *p - 'A' + 10;
+        else
+            break;
+        if (result > (INT32_MAX - digit) / 16)
+            return false;
+        result = 16 * result + digit;
+        p++;
+    }
+    *value = result;
+    return true;
+}
+
 static int32_t parse_alpha_tag(char *str)
 {
     int32_t alpha = 0;
@@ -243,7 +346,8 @@ static int32_t parse_alpha_tag(char *str)
     while (*str == '&' || *str == 'H')
         ++str;
 
-    mystrtoi32(&str, 16, &alpha);
+    if (!parse_simple_hex_tag(str, &alpha))
+        mystrtoi32(&str, 16, &alpha);
     return alpha;
 }
 
@@ -254,7 +358,8 @@ static uint32_t parse_color_tag(char *str)
     while (*str == '&' || *str == 'H')
         ++str;
 
-    mystrtoi32(&str, 16, &color);
+    if (!parse_simple_hex_tag(str, &color))
+        mystrtoi32(&str, 16, &color);
     return ass_bswap32((uint32_t) color);
 }
 
@@ -562,6 +667,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->frz =
                     state->style->Angle;
         } else if (tag("fn")) {
+            ASS_StringView old_family = state->family;
             char *start = args->start;
             if (nargs && strncmp(start, "0", args->end - start)) {
                 skip_spaces(&start);
@@ -571,7 +677,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->family.str = state->style->FontName;
                 state->family.len = strlen(state->style->FontName);
             }
-            ass_update_font(state);
+            if (!ass_string_equal(old_family, state->family))
+                ass_update_font(state);
         } else if (tag("alpha")) {
             int i;
             if (nargs) {
@@ -834,14 +941,18 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             int32_t val = argtoi32(*args);
             if (!nargs || !(val == 0 || val == 1 || val >= 100))
                 val = state->style->Bold;
-            state->bold = val;
-            ass_update_font(state);
+            if (state->bold != val) {
+                state->bold = val;
+                ass_update_font(state);
+            }
         } else if (tag("i")) {
             int32_t val = argtoi32(*args);
             if (!nargs || !(val == 0 || val == 1))
                 val = state->style->Italic;
-            state->italic = val;
-            ass_update_font(state);
+            if (state->italic != val) {
+                state->italic = val;
+                ass_update_font(state);
+            }
         } else if (tag("kt")) {
             // v4++
             double val = 0;
@@ -1177,6 +1288,41 @@ int ass_event_has_hard_overrides(char *str)
                         mystrcmp(&p, "clip") || mystrcmp(&p, "iclip") ||
                         mystrcmp(&p, "org") || mystrcmp(&p, "pbo") ||
                         mystrcmp(&p, "p"))
+                        return 1;
+                }
+                str++;
+            }
+        } else {
+            str++;
+        }
+    }
+    return 0;
+}
+
+int ass_event_has_time_dependent_tags(char *str)
+{
+    // look for time-dependent override tags inside {...}: \t, \move,
+    // \fad/\fade and karaoke (\k, \K, \kf, \ko). Mirrors
+    // ass_event_has_hard_overrides. An event with any of these (or a
+    // scrolling/banner transition effect, handled separately) cannot be served
+    // from a single static layout snapshot. Over-detection is safe (it only
+    // disables the layout cache); a missed tag would silently produce wrong
+    // output, so the token set deliberately errs broad ("k" also covers \kf/\ko).
+    while (*str) {
+        if (str[0] == '\\' && str[1] != '\0') {
+            str += 2;
+        } else if (str[0] == '{') {
+            str++;
+            while (*str && *str != '}') {
+                if (*str == '\\') {
+                    // ass_parse_tags skips spaces/tabs after the backslash
+                    // before the tag name, so "\ t(...)" is a live \t; mirror
+                    // that here or such forms would be wrongly cached.
+                    char *p = str + 1;
+                    skip_spaces(&p);
+                    if (mystrcmp(&p, "move") || mystrcmp(&p, "fad") ||
+                        mystrcmp(&p, "t") || mystrcmp(&p, "k") ||
+                        mystrcmp(&p, "K"))
                         return 1;
                 }
                 str++;

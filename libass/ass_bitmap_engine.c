@@ -60,6 +60,9 @@
 
 
 #define PARAM_BLUR_SET(suffix) \
+    ass_blur1_ ## suffix, \
+    ass_blur2_ ## suffix, \
+    ass_blur3_ ## suffix, \
     ass_blur4_ ## suffix, \
     ass_blur5_ ## suffix, \
     ass_blur6_ ## suffix, \
@@ -79,12 +82,38 @@
 #define BLUR_FUNCTION(name, alignment, suffix) \
     engine.name = ass_ ## name ## alignment ## _ ## suffix;
 
+// Radius 4..8 kernels (SIMD on every target).
 #define PARAM_BLUR_FUNCTION(dir, alignment, suffix) \
-    engine.blur_ ## dir[0] = ass_blur4_ ## dir ## alignment ## _ ## suffix; \
-    engine.blur_ ## dir[1] = ass_blur5_ ## dir ## alignment ## _ ## suffix; \
-    engine.blur_ ## dir[2] = ass_blur6_ ## dir ## alignment ## _ ## suffix; \
-    engine.blur_ ## dir[3] = ass_blur7_ ## dir ## alignment ## _ ## suffix; \
-    engine.blur_ ## dir[4] = ass_blur8_ ## dir ## alignment ## _ ## suffix;
+    engine.blur_ ## dir[3] = ass_blur4_ ## dir ## alignment ## _ ## suffix; \
+    engine.blur_ ## dir[4] = ass_blur5_ ## dir ## alignment ## _ ## suffix; \
+    engine.blur_ ## dir[5] = ass_blur6_ ## dir ## alignment ## _ ## suffix; \
+    engine.blur_ ## dir[6] = ass_blur7_ ## dir ## alignment ## _ ## suffix; \
+    engine.blur_ ## dir[7] = ass_blur8_ ## dir ## alignment ## _ ## suffix;
+
+// Narrow radius 1..3 kernels, used by the ASS_FEATURE_FAST_BLUR path. NEON
+// implements both directions; the x86 SIMD horizontal blur only covers radius
+// >= 4, so on x86 the narrow *horizontal* kernels fall back to the C versions
+// (always built). The vertical SIMD kernels are available for all radii.
+#if CONFIG_ASM && ARCH_X86
+#define PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
+    engine.blur_horz[0] = ass_blur1_horz ## alignment ## _c; \
+    engine.blur_horz[1] = ass_blur2_horz ## alignment ## _c; \
+    engine.blur_horz[2] = ass_blur3_horz ## alignment ## _c;
+#else
+#define PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
+    engine.blur_horz[0] = ass_blur1_horz ## alignment ## _ ## suffix; \
+    engine.blur_horz[1] = ass_blur2_horz ## alignment ## _ ## suffix; \
+    engine.blur_horz[2] = ass_blur3_horz ## alignment ## _ ## suffix;
+#endif
+
+#define PARAM_BLUR_NARROW_VERT(alignment, suffix) \
+    engine.blur_vert[0] = ass_blur1_vert ## alignment ## _ ## suffix; \
+    engine.blur_vert[1] = ass_blur2_vert ## alignment ## _ ## suffix; \
+    engine.blur_vert[2] = ass_blur3_vert ## alignment ## _ ## suffix;
+
+#define PARAM_BLUR_NARROW(alignment, suffix) \
+    PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
+    PARAM_BLUR_NARROW_VERT(alignment, suffix)
 
 #define BLUR_FUNCTIONS(align_order_, alignment, suffix) \
     BLUR_FUNCTION(stripe_unpack, alignment, suffix) \
@@ -93,6 +122,7 @@
     BLUR_FUNCTION(shrink_vert,   alignment, suffix) \
     BLUR_FUNCTION(expand_horz,   alignment, suffix) \
     BLUR_FUNCTION(expand_vert,   alignment, suffix) \
+    PARAM_BLUR_NARROW(alignment, suffix) \
     PARAM_BLUR_FUNCTION(horz, alignment, suffix) \
     PARAM_BLUR_FUNCTION(vert, alignment, suffix) \
     engine.align_order = align_order_;

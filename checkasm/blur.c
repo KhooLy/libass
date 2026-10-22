@@ -189,9 +189,9 @@ void checkasm_check_blur(unsigned cpu_flag)
         check_fixed_filter(engine[i].shrink_vert, "shrink_vert%d", align);
         check_fixed_filter(engine[i].expand_horz, "expand_horz%d", align);
         check_fixed_filter(engine[i].expand_vert, "expand_vert%d", align);
-        for (int n = 4; n <= 8; n++) {
-            check_param_filter(engine[i].blur_horz[n - 4], "blur%d_horz%d", n, align);
-            check_param_filter(engine[i].blur_vert[n - 4], "blur%d_vert%d", n, align);
+        for (int n = 1; n <= 8; n++) {
+            check_param_filter(engine[i].blur_horz[n - 1], "blur%d_horz%d", n, align);
+            check_param_filter(engine[i].blur_vert[n - 1], "blur%d_vert%d", n, align);
         }
     }
 }

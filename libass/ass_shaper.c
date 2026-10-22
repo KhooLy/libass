@@ -65,6 +65,7 @@ struct ass_shaper {
     // Glyph and face-size metrics caches, to speed up shaping
     Cache *face_size_metrics_cache;
     Cache *metrics_cache;
+    CacheClient *cache_client;
 
     hb_font_funcs_t *font_funcs;
     hb_buffer_t *buf;
@@ -78,7 +79,7 @@ struct ass_shaper {
 };
 
 struct ass_shaper_metrics_data {
-    Cache *metrics_cache;
+    ASS_Shaper *shaper;
     FaceSizeMetricsHashKey hash_key;
 };
 
@@ -226,7 +227,7 @@ get_cached_metrics(struct ass_shaper_metrics_data *metrics,
         .size = metrics->hash_key.size,
         .glyph_index = glyph,
     };
-    FT_Glyph_Metrics *val = ass_cache_get(metrics->metrics_cache, &key,
+    FT_Glyph_Metrics *val = ass_cache_get(metrics->shaper->metrics_cache, metrics->shaper->cache_client, &key,
                                           rotate ? metrics : NULL);
     if (!val || val->width < 0)
         return NULL;
@@ -239,11 +240,15 @@ size_t ass_face_size_metrics_construct(void *key, void *value, void *priv)
     FaceSizeMetricsHashKey *k = key;
     FT_Size_Metrics *v = value;
 
+    ass_font_lock(k->font);
+
     FT_Face face = k->font->faces[k->face_index];
 
     ass_face_set_size(face, k->size);
 
     memcpy(v, &face->size->metrics, sizeof(FT_Size_Metrics));
+
+    ass_font_unlock(k->font);
 
     return 1;
 }
@@ -256,13 +261,15 @@ size_t ass_glyph_metrics_construct(void *key, void *value, void *priv)
     int load_flags = FT_LOAD_DEFAULT | FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH
         | FT_LOAD_IGNORE_TRANSFORM;
 
+    ass_font_lock(k->font);
+
     FT_Face face = k->font->faces[k->face_index];
 
     ass_face_set_size(face, k->size);
 
     if (FT_Load_Glyph(face, k->glyph_index, load_flags)) {
         v->width = -1;
-        return 1;
+        goto fail;
     }
 
     memcpy(v, &face->glyph->metrics, sizeof(FT_Glyph_Metrics));
@@ -270,31 +277,46 @@ size_t ass_glyph_metrics_construct(void *key, void *value, void *priv)
     if (priv)  // rotate
         v->horiAdvance = v->vertAdvance;
 
+fail:
+    ass_font_unlock(k->font);
+
     return 1;
 }
+
+struct font_ref {
+    ASS_Font *font;
+    int face_index;
+};
 
 static hb_blob_t*
 get_reference_table(hb_face_t *hbface, hb_tag_t tag, void *font_data)
 {
-  FT_Face face = font_data;
+  struct font_ref *key = font_data;
   FT_ULong len = 0;
+  hb_blob_t *blob = NULL;
+
+  ass_font_lock(key->font);
+
+  FT_Face face = key->font->faces[key->face_index];
 
   if (FT_Load_Sfnt_Table(face, tag, 0, NULL, &len) != FT_Err_Ok)
-    return NULL;
+    goto fail;
 
   char *buf = malloc(len);
   if (!buf)
-    return NULL;
+    goto fail;
 
   if (FT_Load_Sfnt_Table(face, tag, 0, (FT_Byte*)buf, &len) != FT_Err_Ok) {
     free(buf);
-    return NULL;
+    goto fail;
   }
 
-  hb_blob_t *blob = hb_blob_create(buf, len, HB_MEMORY_MODE_WRITABLE, buf, free);
+  blob = hb_blob_create(buf, len, HB_MEMORY_MODE_WRITABLE, buf, free);
   if (len > 0 && hb_blob_is_immutable(blob))
       free(buf);
 
+fail:
+  ass_font_unlock(key->font);
   return blob;
 }
 
@@ -303,11 +325,9 @@ get_glyph_nominal(hb_font_t *font, void *font_data, hb_codepoint_t unicode,
                   hb_codepoint_t *glyph, void *user_data)
 {
     struct ass_shaper_metrics_data *metrics_priv = font_data;
-    FT_Face face = metrics_priv->hash_key.font->faces[metrics_priv->hash_key.face_index];
 
-    *glyph = ass_font_index_magic(face, unicode);
-    if (*glyph)
-        *glyph = FT_Get_Char_Index(face, *glyph);
+    *glyph = ass_font_get_char_index(metrics_priv->hash_key.font,
+                                     metrics_priv->hash_key.face_index, unicode);
     if (!*glyph)
         return false;
 
@@ -387,8 +407,14 @@ get_h_kerning(hb_font_t *font, void *font_data, hb_codepoint_t first,
     FT_Face face = metrics_priv->hash_key.font->faces[metrics_priv->hash_key.face_index];
     FT_Vector kern;
 
+    ass_font_lock(metrics_priv->hash_key.font);
+
+    ass_face_set_size(face, metrics_priv->hash_key.size);
+
     if (FT_Get_Kerning(face, first, second, FT_KERNING_DEFAULT, &kern))
-        return 0;
+        kern.x = 0;
+
+    ass_font_unlock(metrics_priv->hash_key.font);
 
     return kern.x;
 }
@@ -425,25 +451,42 @@ get_contour_point(hb_font_t *font, void *font_data, hb_codepoint_t glyph,
     FT_Face face = metrics_priv->hash_key.font->faces[metrics_priv->hash_key.face_index];
     int load_flags = FT_LOAD_DEFAULT | FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH
         | FT_LOAD_IGNORE_TRANSFORM;
+    bool ret = false;
+
+    ass_font_lock(metrics_priv->hash_key.font);
+
+    ass_face_set_size(face, metrics_priv->hash_key.size);
 
     if (FT_Load_Glyph(face, glyph, load_flags))
-        return false;
+        goto fail;
 
     if (point_index >= (unsigned)face->glyph->outline.n_points)
-        return false;
+        goto fail;
 
     *x = face->glyph->outline.points[point_index].x;
     *y = face->glyph->outline.points[point_index].y;
-    return true;
+    ret = true;
+
+fail:
+    ass_font_unlock(metrics_priv->hash_key.font);
+    return ret;
 }
 
 bool ass_create_hb_font(ASS_Font *font, int index)
 {
-    FT_Face face = font->faces[index];
-    hb_face_t *hb_face = hb_face_create_for_tables(get_reference_table, face, NULL);
+    struct font_ref *key = malloc(sizeof(struct font_ref));
+    if (!key)
+        return false;
+
+    key->font = font;
+    key->face_index = index;
+
+    // key will be freed by harfbuzz if hb_face_create_for_tables fails
+    hb_face_t *hb_face = hb_face_create_for_tables(get_reference_table, key, free);
     if (hb_face_is_immutable(hb_face))
         return false;
 
+    FT_Face face = font->faces[index];
     hb_face_set_index(hb_face, face->face_index);
     hb_face_set_upem(hb_face, face->units_per_EM);
 
@@ -471,7 +514,7 @@ static hb_font_t *get_hb_font(ASS_Shaper *shaper, GlyphInfo *info)
         .face_index = info->face_index,
         .size = info->font_size,
     };
-    FT_Size_Metrics *m = ass_cache_get(shaper->face_size_metrics_cache, &key, NULL);
+    FT_Size_Metrics *m = ass_cache_get(shaper->face_size_metrics_cache, shaper->cache_client, &key, NULL);
     if (!m)
         return NULL;
 
@@ -485,7 +528,7 @@ static hb_font_t *get_hb_font(ASS_Shaper *shaper, GlyphInfo *info)
         hb_font_destroy(hb_font);
         return NULL;
     }
-    metrics->metrics_cache = shaper->metrics_cache;
+    metrics->shaper = shaper;
     metrics->hash_key = key;
 
     hb_font_set_funcs(hb_font, shaper->font_funcs, metrics, free);
@@ -661,6 +704,8 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
 {
     int i;
     hb_buffer_t *buf = shaper->buf;
+    hb_font_t *font = NULL;
+    const GlyphInfo *font_info = NULL;
     hb_segment_properties_t props = HB_SEGMENT_PROPERTIES_DEFAULT;
 
     // Initialize: skip all glyphs, this is undone later as needed
@@ -674,9 +719,18 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         }
 
         int offset = i;
-        hb_font_t *font = get_hb_font(shaper, glyphs + offset);
-        if (!font)
-            return false;
+        const GlyphInfo *info = glyphs + offset;
+        // These are all per-run inputs to get_hb_font. Glyph processing
+        // leaves them unchanged; features and segment properties stay per-run.
+        if (!font || font_info->font != info->font ||
+                font_info->face_index != info->face_index ||
+                font_info->font_size != info->font_size) {
+            hb_font_destroy(font);
+            font = get_hb_font(shaper, glyphs + offset);
+            if (!font)
+                return false;
+            font_info = info;
+        }
         int run_id = glyphs[offset].shape_run_id;
         int level = shaper->emblevels[offset];
 
@@ -717,10 +771,9 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         shape_harfbuzz_process_run(glyphs, buf,
                 shaper->whole_text_layout ? 0 : offset - lead_context);
         hb_buffer_reset(buf);
-
-        hb_font_destroy(font);
     }
 
+    hb_font_destroy(font);
     return true;
 }
 
@@ -740,7 +793,14 @@ void ass_shaper_determine_script(ASS_Shaper *shaper, GlyphInfo *glyphs,
     // determine script (forward scan)
     for (i = 0; i < len; i++) {
         GlyphInfo *info = glyphs + i;
-        info->script = hb_unicode_script(ufuncs, info->symbol);
+        unsigned symbol = info->symbol;
+        if (symbol < 0x80) {
+            info->script = (symbol >= 'A' && symbol <= 'Z') ||
+                           (symbol >= 'a' && symbol <= 'z') ?
+                           HB_SCRIPT_LATIN : HB_SCRIPT_COMMON;
+        } else {
+            info->script = hb_unicode_script(ufuncs, symbol);
+        }
 
         // common/inherit codepoints inherit script from context
         if (info->script == HB_SCRIPT_COMMON ||
@@ -793,11 +853,9 @@ static void shape_fribidi(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
     // update indexes
     for (i = 0; i < len; i++) {
         GlyphInfo *info = glyphs + i;
-        FT_Face face = info->font->faces[info->face_index];
         info->symbol = shaper->event_text[i];
-        info->glyph_index = ass_font_index_magic(face, shaper->event_text[i]);
-        if (info->glyph_index)
-            info->glyph_index = FT_Get_Char_Index(face, info->glyph_index);
+        info->glyph_index = ass_font_get_char_index(info->font, info->face_index,
+                                                    shaper->event_text[i]);
     }
 
     free(joins);
@@ -940,6 +998,33 @@ void ass_shaper_set_whole_text_layout(ASS_Shaper *shaper, bool enable)
 }
 
 /**
+ * \brief Bidi types that resolve to embedding level 0 under an LTR base
+ * direction, provided the whole paragraph contains only such types.
+ *
+ * If a paragraph consists solely of these types (i.e. it contains no R/AL/AN
+ * and no explicit-override or isolate formatting characters), then under an
+ * LTR-resolving base direction every character resolves to embedding level 0
+ * by the Unicode Bidirectional Algorithm:
+ *   - L and CJK/etc. strong-left are level 0 directly;
+ *   - EN is retyped to L by W7 (the backward search hits sor=L or an L, never
+ *     an R, since none exist), so it never reaches I1's +2;
+ *   - ES/ET/CS/ON/NSM resolve as weak/neutral to the base direction (level 0);
+ *   - WS/BS/SS are reset to the paragraph level (0) by L1; BN is removed.
+ * Any excluded type (R, AL, AN, LRE/RLE/LRO/RLO/PDF, LRI/RLI/FSI/PDI) can raise
+ * the level and forces the slow path. This is verified bit-exact against
+ * fribidi_get_par_embedding_levels_ex by a differential fuzzer.
+ */
+static inline bool bidi_type_ltr_level0(FriBidiCharType t)
+{
+    return t == FRIBIDI_TYPE_LTR || t == FRIBIDI_TYPE_EN ||
+           t == FRIBIDI_TYPE_ES  || t == FRIBIDI_TYPE_ET ||
+           t == FRIBIDI_TYPE_CS  || t == FRIBIDI_TYPE_NSM ||
+           t == FRIBIDI_TYPE_BN  || t == FRIBIDI_TYPE_BS  ||
+           t == FRIBIDI_TYPE_SS  || t == FRIBIDI_TYPE_WS  ||
+           t == FRIBIDI_TYPE_ON;
+}
+
+/**
  * \brief Shape an event's text. Calculates directional runs and shapes them.
  * \param text_info event's text
  * \return success, when 0
@@ -960,16 +1045,28 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
     fribidi_get_bidi_types(shaper->event_text,
             text_info->length, shaper->ctypes);
 
+    // A paragraph whose every character resolves to embedding level 0 under an
+    // LTR base can skip the (malloc-heavy) fribidi bidi resolution entirely.
+    // This covers the overwhelmingly common Latin/CJK/Cyrillic/... subtitle
+    // text. Only the LTR-resolving base directions libass uses qualify; any
+    // disqualifying character drops the whole event onto the fribidi slow path.
+    bool simple_ltr = shaper->base_direction == FRIBIDI_PAR_LTR ||
+                      shaper->base_direction == FRIBIDI_PAR_ON;
+
     int n_pars = 1;
-    for (i = 0; i < text_info->length - 1; i++)
-        if (shaper->ctypes[i] == FRIBIDI_TYPE_BS)
+    for (i = 0; i < text_info->length; i++) {
+        FriBidiCharType t = shaper->ctypes[i];
+        if (i < text_info->length - 1 && t == FRIBIDI_TYPE_BS)
             n_pars++;
+        if (!bidi_type_ltr_level0(t))
+            simple_ltr = false;
+    }
 
     if (!check_par_allocations(shaper, n_pars))
         return false;
 
 #ifdef USE_FRIBIDI_EX_API
-    if (shaper->bidi_brackets) {
+    if (shaper->bidi_brackets && !simple_ltr) {
         fribidi_get_bracket_types(shaper->event_text,
                 text_info->length, shaper->ctypes, shaper->btypes);
     }
@@ -985,19 +1082,36 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
                 (!shaper->whole_text_layout &&
                     (glyphs[i + 1].starts_new_run || glyphs[i].hspacing))) {
             dir = shaper->base_direction;
+            if (simple_ltr) {
+                // All embedding levels are 0. The resolved paragraph direction
+                // matches fribidi's: a strong-LTR base stays LTR; an auto (ON)
+                // base becomes LTR iff the paragraph has a strong-L character,
+                // otherwise fribidi leaves it as ON (no strong char to resolve).
+                memset(shaper->emblevels + last_break, 0,
+                       (i - last_break + 1) * sizeof(*shaper->emblevels));
+                if (dir == FRIBIDI_PAR_ON) {
+                    for (int j = last_break; j <= i; j++) {
+                        if (shaper->ctypes[j] == FRIBIDI_TYPE_LTR) {
+                            dir = FRIBIDI_PAR_LTR;
+                            break;
+                        }
+                    }
+                }
+            } else {
 #ifdef USE_FRIBIDI_EX_API
-            FriBidiBracketType *btypes = NULL;
-            if (shaper->bidi_brackets)
-                btypes = shaper->btypes + last_break;
-            ret = fribidi_get_par_embedding_levels_ex(
-                    shaper->ctypes + last_break, btypes,
-                    i - last_break + 1, &dir, shaper->emblevels + last_break);
+                FriBidiBracketType *btypes = NULL;
+                if (shaper->bidi_brackets)
+                    btypes = shaper->btypes + last_break;
+                ret = fribidi_get_par_embedding_levels_ex(
+                        shaper->ctypes + last_break, btypes,
+                        i - last_break + 1, &dir, shaper->emblevels + last_break);
 #else
-            ret = fribidi_get_par_embedding_levels(shaper->ctypes + last_break,
-                    i - last_break + 1, &dir, shaper->emblevels + last_break);
+                ret = fribidi_get_par_embedding_levels(shaper->ctypes + last_break,
+                        i - last_break + 1, &dir, shaper->emblevels + last_break);
 #endif
-            if (ret == 0)
-                return false;
+                if (ret == 0)
+                    return false;
+            }
             last_break = i + 1;
             if (shaper->whole_text_layout)
                 *pdir++ = dir;
@@ -1017,7 +1131,7 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
 /**
  * \brief Create a new shaper instance
  */
-ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache)
+ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache, CacheClient *cache_client)
 {
     assert(metrics_cache);
 
@@ -1031,6 +1145,7 @@ ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache)
         goto error;
     shaper->face_size_metrics_cache = face_size_metrics_cache;
     shaper->metrics_cache = metrics_cache;
+    shaper->cache_client = cache_client;
 
     hb_font_funcs_t *funcs = shaper->font_funcs = hb_font_funcs_create();
     if (hb_font_funcs_is_immutable(funcs))
@@ -1090,8 +1205,17 @@ FriBidiStrIndex *ass_shaper_reorder(ASS_Shaper *shaper, TextInfo *text_info)
     int i, ret;
 
     // Initialize reorder map
-    for (i = 0; i < text_info->length; i++)
+    bool needs_reorder = false;
+    for (i = 0; i < text_info->length; i++) {
         shaper->cmap[i] = i;
+        needs_reorder |= shaper->emblevels[i] != 0;
+    }
+
+    // Level-zero lines are already in visual order. With flags == 0 and no
+    // visual string, fribidi_reorder_line can only leave this identity map and
+    // the already-zero levels unchanged.
+    if (!needs_reorder)
+        return shaper->cmap;
 
     // Create reorder map line-by-line or run-by-run
     int last_break = 0;

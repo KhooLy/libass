@@ -31,6 +31,8 @@ static void ass_reconfigure(ASS_Renderer *priv)
     ASS_Settings *settings = &priv->settings;
 
     priv->render_id++;
+    priv->layout_gen++;                         // invalidate the layout cache
+    ass_cache_promote(&priv->cache.client_set); // Just in case
     ass_cache_empty(priv->cache.composite_cache);
     ass_cache_empty(priv->cache.bitmap_cache);
     ass_cache_empty(priv->cache.outline_cache);
@@ -64,6 +66,22 @@ void ass_set_frame_size(ASS_Renderer *priv, int w, int h)
     }
 }
 
+unsigned ass_set_threads(ASS_Renderer *priv, unsigned threads)
+{
+#if ENABLE_THREADS
+    priv->library->thread_safe_cb = 1;
+
+    if (threads == 0)
+        threads = default_threads();
+
+    priv->settings.threads = threads;
+
+    return threads;
+#else
+    return 0;
+#endif
+}
+
 void ass_set_storage_size(ASS_Renderer *priv, int w, int h)
 {
     if (w <= 0 || h <= 0 || w > FFMIN(INT_MAX, SIZE_MAX) / h)
@@ -79,10 +97,13 @@ void ass_set_storage_size(ASS_Renderer *priv, int w, int h)
 void ass_set_shaper(ASS_Renderer *priv, ASS_ShapingLevel level)
 {
     // select the complex shaper for illegal values
-    if (level == ASS_SHAPING_SIMPLE || level == ASS_SHAPING_COMPLEX)
-        priv->settings.shaper = level;
-    else
-        priv->settings.shaper = ASS_SHAPING_COMPLEX;
+    ASS_ShapingLevel new_level =
+        (level == ASS_SHAPING_SIMPLE || level == ASS_SHAPING_COMPLEX) ?
+            level : ASS_SHAPING_COMPLEX;
+    if (priv->settings.shaper != new_level) {
+        priv->settings.shaper = new_level;
+        priv->layout_gen++;     // shaper level affects layout (not reconfigure)
+    }
 }
 
 void ass_set_margins(ASS_Renderer *priv, int t, int b, int l, int r)
@@ -99,7 +120,10 @@ void ass_set_margins(ASS_Renderer *priv, int t, int b, int l, int r)
 
 void ass_set_use_margins(ASS_Renderer *priv, int use)
 {
-    priv->settings.use_margins = use;
+    if (priv->settings.use_margins != use) {
+        priv->settings.use_margins = use;
+        priv->layout_gen++;     // affects layout/clip geometry (not reconfigure)
+    }
 }
 
 void ass_set_aspect_ratio(ASS_Renderer *priv, double dar, double sar)
@@ -134,7 +158,10 @@ void ass_set_hinting(ASS_Renderer *priv, ASS_Hinting ht)
 
 void ass_set_line_spacing(ASS_Renderer *priv, double line_spacing)
 {
-    priv->settings.line_spacing = line_spacing;
+    if (priv->settings.line_spacing != line_spacing) {
+        priv->settings.line_spacing = line_spacing;
+        priv->layout_gen++;     // affects line height/layout (not reconfigure)
+    }
 }
 
 void ass_set_line_position(ASS_Renderer *priv, double line_position)

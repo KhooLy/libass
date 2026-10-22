@@ -20,6 +20,8 @@
 #include "ass_compat.h"
 
 #include <assert.h>
+#include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
@@ -27,6 +29,11 @@
 
 #ifdef CONFIG_UNIBREAK
 #include <linebreak.h>
+#endif
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #endif
 
 #include "ass.h"
@@ -40,6 +47,7 @@
 #define MAX_LINES_INITIAL 64
 #define MAX_BITMAPS_INITIAL 16
 #define MAX_SUB_BITMAPS_INITIAL 64
+#define MAX_LAYER_SORT_RANGE 64
 #define SUBPIXEL_MASK 63
 #define STROKER_PRECISION 16     // stroker error in integer units, unrelated to final accuracy
 #define RASTERIZER_PRECISION 16  // rasterizer spline approximation error in 1/64 pixel units
@@ -47,6 +55,7 @@
 #define MAX_PERSP_SCALE 16.0
 #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
 #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
+#define MOTION_CACHE_SUBPIXEL_STEP 2  // snap 1/8-pixel phases to a 1/4-pixel grid
 
 
 static bool text_info_init(TextInfo* text_info)
@@ -68,8 +77,37 @@ static bool text_info_init(TextInfo* text_info)
     return true;
 }
 
+static ImagePool *image_pool_create(void);
+static void image_pool_renderer_done(ImagePool *pool);
+static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                     ASS_Event *event);
+
+// Static-event layout cache — see ass_render.h:LayoutSnapshot.
+static void layout_cache_flush(ASS_Renderer *priv);
+static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame);
+static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv, ASS_Event *event);
+
+#if ENABLE_THREADS
+static inline void layout_cache_lock(ASS_Renderer *priv)
+{
+    if (priv->layout_cache_mutex_inited)
+        pthread_mutex_lock(&priv->layout_cache_mutex);
+}
+static inline void layout_cache_unlock(ASS_Renderer *priv)
+{
+    if (priv->layout_cache_mutex_inited)
+        pthread_mutex_unlock(&priv->layout_cache_mutex);
+}
+#else
+#define layout_cache_lock(priv) ((void) (priv))
+#define layout_cache_unlock(priv) ((void) (priv))
+#endif
+
 static void text_info_done(TextInfo* text_info)
 {
+    if (text_info->combined_bitmaps)
+        for (int i = 0; i < text_info->max_bitmaps; i++)
+            free(text_info->combined_bitmaps[i].bitmaps);
     free(text_info->glyphs);
     free(text_info->event_text);
     free(text_info->breaks);
@@ -84,8 +122,14 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
     if (!text_info_init(&state->text_info))
         return false;
 
-    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache)))
+    state->cache_client = ass_cache_client_create(&priv->cache.client_set);
+    if (!state->cache_client)
         return false;
+
+    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache, state->cache_client)))
+        return false;
+
+    state->image_pool = image_pool_create();  // NULL => fall back to malloc
 
     return ass_rasterizer_init(&priv->engine, &state->rasterizer, RASTERIZER_PRECISION);
 }
@@ -98,6 +142,9 @@ static void render_context_done(RenderContext *state)
         ass_shaper_free(state->shaper);
 
     text_info_done(&state->text_info);
+
+    image_pool_renderer_done(state->image_pool);
+    state->image_pool = NULL;
 }
 
 ASS_Renderer *ass_renderer_init(ASS_Library *library)
@@ -147,9 +194,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
         !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
         goto fail;
 
-    priv->cache.glyph_max = GLYPH_CACHE_MAX;
-    priv->cache.bitmap_max_size = BITMAP_CACHE_MAX_SIZE;
-    priv->cache.composite_max_size = COMPOSITE_CACHE_MAX_SIZE;
+    if (!ass_cache_client_set_init(&priv->cache.client_set))
+        goto fail;
+
+    const char *glyph_str = getenv("LIBASS_GLYPH_CACHE_MAX");
+    const char *bitmap_str = getenv("LIBASS_BITMAP_CACHE_MAX");
+    int glyph_size = glyph_str ? atoi(glyph_str) : 0;
+    int bitmap_size = bitmap_str ? atoi(bitmap_str) : 0;
+
+    ass_set_cache_limits(priv, glyph_size, bitmap_size);
 
     if (!render_context_init(&priv->state, priv))
         goto fail;
@@ -161,6 +214,43 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
 
     ass_shaper_info(library);
     priv->settings.shaper = ASS_SHAPING_COMPLEX;
+
+#if ENABLE_THREADS
+    priv->settings.threads = default_threads();
+
+    if (pthread_mutex_init(&priv->mutex, NULL) != 0)
+        goto thread_fail;
+
+    priv->mutex_inited = true;
+
+    // Must succeed before threads run: layout_cache_lock is a no-op while
+    // uninited, so failing here without disabling threading would leave the
+    // snapshot registry unsynchronized across workers. goto thread_fail forces
+    // the serial path, where the no-op lock is safe.
+    if (pthread_mutex_init(&priv->layout_cache_mutex, NULL) != 0)
+        goto thread_fail;
+    priv->layout_cache_mutex_inited = true;
+
+    if (pthread_cond_init(&priv->main_cond, NULL) != 0)
+        goto thread_fail;
+
+    priv->main_cond_inited = true;
+
+    if (pthread_cond_init(&priv->pool_cond, NULL) != 0)
+        goto thread_fail;
+
+    priv->pool_cond_inited = true;
+
+    atomic_init(&priv->processing_eimgs, 0);
+    atomic_init(&priv->sent_eimgs, 0);
+    atomic_init(&priv->next_eimg, 0);
+
+thread_fail:
+    if (!priv->pool_cond_inited) {
+        ass_msg(library, MSGL_WARN, "Failed to initialize threading functionality; disabling");
+        priv->thread_start_failed = 1;
+    }
+#endif
 
     ass_msg(library, MSGL_V, "Initialized");
 
@@ -175,13 +265,55 @@ fail:
 
 static void free_event_index(ASS_Renderer *priv);
 
+#if ENABLE_THREADS
+static void join_threads(ASS_Renderer *render_priv)
+{
+    if (render_priv->threads) {
+        pthread_mutex_lock(&render_priv->mutex);
+        render_priv->shutting_down = 1;
+        pthread_mutex_unlock(&render_priv->mutex);
+        pthread_cond_broadcast(&render_priv->pool_cond);
+
+        for (unsigned i = 0; i < render_priv->n_threads; i++)
+            pthread_join(render_priv->threads[i], NULL);
+
+        free(render_priv->threads);
+
+        render_priv->threads = NULL;
+        render_priv->n_threads = 0;
+        render_priv->started_threads = 0;
+    }
+}
+#endif
+
 void ass_renderer_done(ASS_Renderer *render_priv)
 {
     if (!render_priv)
         return;
 
+#if ENABLE_THREADS
+    join_threads(render_priv);
+
+    if (render_priv->mutex_inited)
+        pthread_mutex_destroy(&render_priv->mutex);
+    if (render_priv->main_cond_inited)
+        pthread_cond_destroy(&render_priv->main_cond);
+    if (render_priv->pool_cond_inited)
+        pthread_cond_destroy(&render_priv->pool_cond);
+#endif
+
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
+
+    // Free all live layout snapshots (dec_ref'ing held outline/font refs) while
+    // the caches are still alive, then drop the registry mutex.
+    layout_cache_flush(render_priv);
+#if ENABLE_THREADS
+    if (render_priv->layout_cache_mutex_inited)
+        pthread_mutex_destroy(&render_priv->layout_cache_mutex);
+#endif
+
+    render_context_done(&render_priv->state);
 
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
@@ -189,6 +321,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     ass_cache_done(render_priv->cache.face_size_metrics_cache);
     ass_cache_done(render_priv->cache.metrics_cache);
     ass_cache_done(render_priv->cache.font_cache);
+    ass_cache_client_set_done(&render_priv->cache.client_set);
 
     if (render_priv->fontselect)
         ass_fontselect_free(render_priv->fontselect);
@@ -197,8 +330,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     free(render_priv->eimg);
     free(render_priv->stateless_rp);
     free_event_index(render_priv);
-
-    render_context_done(&render_priv->state);
+    free(render_priv->eimg_sorted);
 
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);
@@ -212,12 +344,108 @@ void ass_renderer_done(ASS_Renderer *render_priv)
  * \brief Create a new ASS_Image
  * Parameters are the same as ASS_Image fields.
  */
-static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
-                                 int bitmap_h, int stride, int dst_x,
-                                 int dst_y, uint32_t color,
+static ImagePool *image_pool_create(void)
+{
+    ImagePool *pool = calloc(1, sizeof(ImagePool));
+    if (pool) {
+#if ENABLE_THREADS
+        if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+            free(pool);
+            return NULL;
+        }
+#endif
+        pool->renderer_alive = true;
+    }
+    return pool;
+}
+
+#if ENABLE_THREADS
+static inline void image_pool_lock(ImagePool *pool)
+{
+    pthread_mutex_lock(&pool->mutex);
+}
+
+static inline void image_pool_unlock(ImagePool *pool)
+{
+    pthread_mutex_unlock(&pool->mutex);
+}
+#else
+static inline void image_pool_lock(ImagePool *pool) { (void) pool; }
+static inline void image_pool_unlock(ImagePool *pool) { (void) pool; }
+#endif
+
+// Called with the mutex held after dropping renderer or image ownership.
+// Only the final owner can see no renderer or live images and claim destruction;
+// callers must not access the pool after this releases the mutex.
+static void image_pool_unlock_or_destroy(ImagePool *pool)
+{
+    if (pool->renderer_alive || pool->live) {
+        image_pool_unlock(pool);
+        return;
+    }
+
+    ASS_ImagePriv *cur = pool->free_list;
+    pool->free_list = NULL;
+    image_pool_unlock(pool);
+
+#if ENABLE_THREADS
+    pthread_mutex_destroy(&pool->mutex);
+#endif
+
+    while (cur) {
+        ASS_ImagePriv *next = (ASS_ImagePriv *) cur->result.next;
+        free(cur);
+        cur = next;
+    }
+    free(pool);
+}
+
+static void image_pool_renderer_done(ImagePool *pool)
+{
+    if (!pool)
+        return;
+
+    image_pool_lock(pool);
+    pool->renderer_alive = false;
+    image_pool_unlock_or_destroy(pool);
+}
+
+// Obtain an ASS_ImagePriv shell, reusing a recycled one when available.
+static ASS_ImagePriv *image_pool_alloc(ImagePool *pool)
+{
+    ASS_ImagePriv *img;
+
+    if (pool) {
+        image_pool_lock(pool);
+        if (pool->free_list) {
+            img = pool->free_list;
+            pool->free_list = (ASS_ImagePriv *) img->result.next;
+        } else {
+            img = malloc(sizeof(ASS_ImagePriv));
+            if (!img) {
+                image_pool_unlock(pool);
+                return NULL;
+            }
+        }
+        pool->live++;
+        image_pool_unlock(pool);
+    } else {
+        img = malloc(sizeof(ASS_ImagePriv));
+        if (!img)
+            return NULL;
+    }
+
+    img->pool = pool;
+    img->shared = NULL;   // only clone_image_snapshot sets this; recycled shells may be stale
+    return img;
+}
+
+static ASS_Image *my_draw_bitmap(ImagePool *pool, unsigned char *bitmap,
+                                 int bitmap_w, int bitmap_h, int stride,
+                                 int dst_x, int dst_y, uint32_t color,
                                  CompositeHashValue *source)
 {
-    ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
+    ASS_ImagePriv *img = image_pool_alloc(pool);
     if (!img) {
         if (!source)
             ass_aligned_free(bitmap);
@@ -238,6 +466,48 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
     img->ref_count = 0;
 
     return &img->result;
+}
+
+// Ref-counted read-only pixel buffer backing cloned owned-buffer images (vector
+// clip / opaque-box background) in the layout cache. The capturing snapshot holds
+// one ref; each clone holds one ref; the buffer (and this header) is freed only
+// when the last ref drops. So a shared master always outlives every emitted image
+// that points into it, even if the snapshot is freed (gen bump / teardown) while
+// the user still holds a rendered frame — matching how emitted images already
+// outlive their source composite. refs is atomic to match the multi-threaded
+// render/free of pooled images.
+struct shared_buffer {
+    _Atomic AtomicInt refs;
+    unsigned char *data;
+};
+
+static SharedBuffer *shared_buffer_new(unsigned align,
+                                       const unsigned char *src, size_t size)
+{
+    SharedBuffer *sb = malloc(sizeof(*sb));
+    if (!sb)
+        return NULL;
+    sb->data = ass_aligned_alloc(align, size, false);
+    if (!sb->data) {
+        free(sb);
+        return NULL;
+    }
+    memcpy(sb->data, src, size);
+    atomic_init(&sb->refs, 1);
+    return sb;
+}
+
+static void shared_buffer_ref(SharedBuffer *sb)
+{
+    inc_ref(&sb->refs);
+}
+
+static void shared_buffer_unref(SharedBuffer *sb)
+{
+    if (dec_ref(&sb->refs) == 0) {
+        ass_aligned_free(sb->data);
+        free(sb);
+    }
 }
 
 /**
@@ -391,23 +661,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
         // split up into left and right for karaoke, if needed
         if (lbrk > r[j].x0) {
             if (lbrk > r[j].x1) lbrk = r[j].x1;
-            img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + r[j].x0,
-                                 lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + r[j].x0, dst_y + r[j].y0, color, source);
-            if (!img) break;
-            img->type = type;
-            *tail = img;
-            tail = &img->next;
+            if (_a(color) != 0xFF) {
+                img = my_draw_bitmap(state->image_pool, bm->buffer + r[j].y0 * bm->stride + r[j].x0,
+                                     lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
+                                     dst_x + r[j].x0, dst_y + r[j].y0, color, source);
+                if (!img) break;
+                img->type = type;
+                *tail = img;
+                tail = &img->next;
+            }
         }
         if (lbrk < r[j].x1) {
             if (lbrk < r[j].x0) lbrk = r[j].x0;
-            img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + lbrk,
-                                 r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + lbrk, dst_y + r[j].y0, color2, source);
-            if (!img) break;
-            img->type = type;
-            *tail = img;
-            tail = &img->next;
+            if (_a(color2) != 0xFF) {
+                img = my_draw_bitmap(state->image_pool, bm->buffer + r[j].y0 * bm->stride + lbrk,
+                                     r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
+                                     dst_x + lbrk, dst_y + r[j].y0, color2, source);
+                if (!img) break;
+                img->type = type;
+                *tail = img;
+                tail = &img->next;
+            }
         }
     }
 
@@ -478,24 +752,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
     if (brk > b_x0) {           // draw left part
         if (brk > b_x1)
             brk = b_x1;
-        img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + b_x0,
-                             brk - b_x0, b_y1 - b_y0, bm->stride,
-                             dst_x + b_x0, dst_y + b_y0, color, source);
-        if (!img) return tail;
-        img->type = type;
-        *tail = img;
-        tail = &img->next;
+        if (_a(color) != 0xFF) {
+            img = my_draw_bitmap(state->image_pool, bm->buffer + bm->stride * b_y0 + b_x0,
+                                 brk - b_x0, b_y1 - b_y0, bm->stride,
+                                 dst_x + b_x0, dst_y + b_y0, color, source);
+            if (!img) return tail;
+            img->type = type;
+            *tail = img;
+            tail = &img->next;
+        }
     }
     if (brk < b_x1) {           // draw right part
         if (brk < b_x0)
             brk = b_x0;
-        img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + brk,
-                             b_x1 - brk, b_y1 - b_y0, bm->stride,
-                             dst_x + brk, dst_y + b_y0, color2, source);
-        if (!img) return tail;
-        img->type = type;
-        *tail = img;
-        tail = &img->next;
+        if (_a(color2) != 0xFF) {
+            img = my_draw_bitmap(state->image_pool, bm->buffer + bm->stride * b_y0 + brk,
+                                 b_x1 - brk, b_y1 - b_y0, bm->stride,
+                                 dst_x + brk, dst_y + b_y0, color2, source);
+            if (!img) return tail;
+            img->type = type;
+            *tail = img;
+            tail = &img->next;
+        }
     }
     return tail;
 }
@@ -516,6 +794,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     double y0 = (bbox->y_min + bbox->y_max) / 2.0;
     double dx = (bbox->x_max - bbox->x_min) / 2.0 + 64;
     double dy = (bbox->y_max - bbox->y_min) / 2.0 + 64;
+    bool affine = m[2][0] == 0. && m[2][1] == 0.;
 
     // Change input coordinates' origin to (x0, y0),
     // after that transformation x:[-dx, dx], y:[-dy, dy],
@@ -531,9 +810,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     double center[2] = { m[0][2] * w, m[1][2] * w };
     // Change output coordinates' origin to center,
     // m_xz and m_yz is skipped as it becomes 0 and no longer needed.
-    for (int i = 0; i < 2; i++)
-        for (int j = 0; j < 2; j++)
-            m[i][j] -= m[2][j] * center[i];
+    if (!affine) {
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+                m[i][j] -= m[2][j] * center[i];
+    }
 
     double delta[2] = {0};
     if (!first) {
@@ -551,9 +832,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     }
 
     // Minimal bounding box z coordinate
-    double z0 = m[2][2] - fabs(m[2][0]) * dx - fabs(m[2][1]) * dy;
+    double z0 = affine ? m[2][2] :
+        m[2][2] - fabs(m[2][0]) * dx - fabs(m[2][1]) * dy;
     // z0 clamped to z_center / MAX_PERSP_SCALE to mitigate problems with small z
-    w = 1.0 / POSITION_PRECISION / FFMAX(z0, m[2][2] / MAX_PERSP_SCALE);
+    w = 1.0 / POSITION_PRECISION /
+        (affine ? z0 : FFMAX(z0, m[2][2] / MAX_PERSP_SCALE));
     double mul[2] = { dx * w, dy * w };  // 1 / q_x, 1 / q_y
 
     // z0 = m_zz - |m_zx| * dx - |m_zy| * dy,
@@ -630,11 +913,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     mul[0] *= w;
     mul[1] *= w;
 
-    for (int j = 0; j < 2; j++) {
-        double val = m[2][j] * mul[j];
-        if (!(fabs(val) < max_val))
-            return false;
-        qm[2][j] = ass_lrint(val);
+    if (affine) {
+        qm[2][0] = qm[2][1] = 0;
+    } else {
+        for (int j = 0; j < 2; j++) {
+            double val = m[2][j] * mul[j];
+            if (!(fabs(val) < max_val))
+                return false;
+            qm[2][j] = ass_lrint(val);
+        }
     }
 
     if (first && offset) {
@@ -651,6 +938,63 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     key->matrix_y.x = qm[1][0];  key->matrix_y.y = qm[1][1];
     key->matrix_z.x = qm[2][0];  key->matrix_z.y = qm[2][1];
     return true;
+}
+
+static inline double scale_by_pow2(double value, int exponent)
+{
+    // These small exponents cover normal subtitle scaling. Multiplication by
+    // an exactly represented power of two has the same result as ldexp on a
+    // binary floating-point implementation, but avoids an out-of-line libm
+    // call on platforms without a scale opcode.
+#if FLT_RADIX == 2
+    switch (exponent) {
+    case -4: return value * 0x1p-4;
+    case -3: return value * 0x1p-3;
+    case -2: return value * 0x1p-2;
+    case -1: return value * 0x1p-1;
+    case  0: return value;
+    case  1: return value * 0x1p1;
+    case  2: return value * 0x1p2;
+    case  3: return value * 0x1p3;
+    case  4: return value * 0x1p4;
+    default: break;
+    }
+#endif
+    return ldexp(value, exponent);
+}
+
+static int32_t round_to_step(int32_t value, int32_t step)
+{
+    if (step <= 1)
+        return value;
+
+    int64_t v = value;
+    if (v >= 0)
+        return (int32_t) (((v + step / 2) / step) * step);
+    return (int32_t) (-(((-v + step / 2) / step) * step));
+}
+
+static void snap_subpixel_offset(int32_t *offset, int *pos)
+{
+    int32_t snapped = round_to_step(*offset, MOTION_CACHE_SUBPIXEL_STEP);
+    if (snapped >= (1 << SUBPIXEL_ORDER)) {
+        snapped -= 1 << SUBPIXEL_ORDER;
+        (*pos)++;
+    }
+    *offset = snapped;
+}
+
+static void snap_motion_cache_key(BitmapHashKey *key, ASS_Vector *pos)
+{
+    snap_subpixel_offset(&key->offset.x, &pos->x);
+    snap_subpixel_offset(&key->offset.y, &pos->y);
+}
+
+static bool motion_cache_enabled(RenderContext *state, GlyphInfo *info)
+{
+    return (state->renderer->track->parser_priv->feature_flags &
+            FEATURE_MASK(ASS_FEATURE_MOTION_CACHE)) &&
+           (info->blur > 0 || info->be);
 }
 
 static void restore_transform(double m[3][3], const BitmapHashKey *key)
@@ -725,12 +1069,12 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
 
     ASS_Vector pos;
     BitmapHashKey key;
-    key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
+    key.outline = ass_cache_get(render_priv->cache.outline_cache, state->cache_client, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
             !quantize_transform(m, &pos, NULL, true, &key))
         return;
 
-    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
     if (!clip_bm)
         return;
 
@@ -1150,7 +1494,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
 
     ass_apply_transition_effects(state);
     state->explicit = state->evt_type != EVENT_NORMAL ||
-                      ass_event_has_hard_overrides(event->Text);
+                      event_has_hard_overrides(render_priv, event);
 
     ass_reset_render_context(state, NULL);
     state->alignment = state->style->Alignment;
@@ -1186,7 +1530,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
     if (info->drawing_text.str) {
         key.type = OUTLINE_DRAWING;
         key.u.drawing.text = info->drawing_text;
-        val = ass_cache_get(priv->cache.outline_cache, &key, priv);
+        val = ass_cache_get(priv->cache.outline_cache, state->cache_client, &key, priv);
         if (!val || !val->valid)
             return;
 
@@ -1209,7 +1553,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
         k->italic = info->italic;
         k->flags = info->flags;
 
-        val = ass_cache_get(priv->cache.outline_cache, &key, priv);
+        val = ass_cache_get(priv->cache.outline_cache, state->cache_client, &key, priv);
         if (!val || !val->valid)
             return;
 
@@ -1247,16 +1591,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
     case OUTLINE_GLYPH:
         {
             GlyphHashKey *k = &outline_key->u.glyph;
+            ass_font_lock(k->font);
             ass_face_set_size(k->font->faces[k->face_index], k->size);
             if (!ass_font_get_glyph(k->font, k->face_index, k->glyph_index,
-                                    render_priv->settings.hinting))
+                                    render_priv->settings.hinting)) {
+                ass_font_unlock(k->font);
                 return 1;
+            }
             if (!ass_get_glyph_outline(&v->outline[0], &v->advance,
                                        k->font->faces[k->face_index],
-                                       k->flags))
+                                       k->flags)) {
+                ass_font_unlock(k->font);
                 return 1;
+            }
             ass_font_get_asc_desc(k->font, k->face_index,
                                   &v->asc, &v->desc);
+            ass_font_unlock(k->font);
             break;
         }
     case OUTLINE_DRAWING:
@@ -1337,9 +1687,18 @@ static void calc_transform_matrix(RenderContext *state,
     double fry = ASS_PI / 180 * info->fry;
     double frz = ASS_PI / 180 * info->frz;
 
-    double sx = -sin(frx), cx = cos(frx);
-    double sy =  sin(fry), cy = cos(fry);
-    double sz = -sin(frz), cz = cos(frz);
+    // Most glyphs are unrotated, yet sin/cos of the (zero) angles are still
+    // computed via libm on every glyph, before the bitmap cache lookup. Skip
+    // the calls when the angle is exactly 0. Bit-exact: ASS_PI/180 * 0 == +0.0,
+    // sin(+0.0) == +0.0, cos(+0.0) == 1.0, so -sin(0) == -0.0 etc.; we
+    // substitute those exact values (including the negative zero).
+    double sx, cx, sy, cy, sz, cz;
+    if (frx == 0.) { sx = -0.0; cx = 1.0; }
+    else { sx = -sin(frx); cx = cos(frx); }
+    if (fry == 0.) { sy = 0.0;  cy = 1.0; }
+    else { sy =  sin(fry); cy = cos(fry); }
+    if (frz == 0.) { sz = -0.0; cz = 1.0; }
+    else { sz = -sin(frz); cz = cos(frz); }
 
     double fax = info->fax * info->scale_x / info->scale_y;
     double fay = info->fay * info->scale_y / info->scale_x;
@@ -1413,8 +1772,12 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     key.outline = info->outline;
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
+    if (motion_cache_enabled(state, info))
+        snap_motion_cache_key(&key, pos);
 
-    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
+    if (!info->bm)
+        state->alloc_error = true;
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
 
@@ -1515,8 +1878,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         w *= STROKER_PRECISION / POSITION_PRECISION;
         frexp(w * (FFMAX(mxx, myx) + mzx * rz), &k->scale_ord_x);
         frexp(w * (FFMAX(mxy, myy) + mzy * rz), &k->scale_ord_y);
-        bord_x = ldexp(bord_x, k->scale_ord_x);
-        bord_y = ldexp(bord_y, k->scale_ord_y);
+        bord_x = scale_by_pow2(bord_x, k->scale_ord_x);
+        bord_y = scale_by_pow2(bord_y, k->scale_ord_y);
         if (!(bord_x < OUTLINE_MAX && bord_y < OUTLINE_MAX))
             return;
         k->border.x = ass_lrint(bord_x / STROKER_PRECISION);
@@ -1527,18 +1890,24 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         }
 
         for (int i = 0; i < 3; i++) {
-            m[i][0] = ldexp(m2[i][0], -k->scale_ord_x);
-            m[i][1] = ldexp(m2[i][1], -k->scale_ord_y);
+            m[i][0] = scale_by_pow2(m2[i][0], -k->scale_ord_x);
+            m[i][1] = scale_by_pow2(m2[i][1], -k->scale_ord_y);
             m[i][2] = m2[i][2];
         }
     }
 
-    key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
+    key.outline = ass_cache_get(render_priv->cache.outline_cache, state->cache_client, &ol_key, render_priv);
+    if (!key.outline)
+        state->alloc_error = true;
     if (!key.outline || !key.outline->valid ||
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
+    if (motion_cache_enabled(state, info))
+        snap_motion_cache_key(&key, pos_o);
 
-    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
+    if (!info->bm_o)
+        state->alloc_error = true;
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
         *pos_o = *pos;
@@ -2456,11 +2825,16 @@ static void render_and_combine_glyphs(RenderContext *state,
     TextInfo *text_info = &state->text_info;
     int left = render_priv->settings.left_margin;
     device_x = (device_x - left) * render_priv->par_scale_x + left;
+    state->alloc_error = false;
     unsigned nb_bitmaps = 0;
     bool new_run = true;
     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
     CombinedBitmapInfo *current_info = NULL;
     ASS_DVector offset;
+    // Loop-invariant blur scale (depends only on the event render context).
+    const double blur_radius_scale = 2 / sqrt(log(256));
+    const double blur_scale_x = state->blur_scale_x * blur_radius_scale;
+    const double blur_scale_y = state->blur_scale_y * blur_radius_scale;
     for (int i = 0; i < text_info->length; i++) {
         GlyphInfo *info = text_info->glyphs + i;
         if (info->starts_new_run) new_run = true;
@@ -2469,6 +2843,9 @@ static void render_and_combine_glyphs(RenderContext *state,
 
         for (; info; info = info->next) {
             int flags = 0;
+            if (render_priv->track->parser_priv->feature_flags &
+                FEATURE_MASK(ASS_FEATURE_FAST_BLUR))
+                flags |= FILTER_FAST_BLUR;
             if (info->border_style == 3)
                 flags |= FILTER_BORDER_STYLE_3;
             if (info->border_x || info->border_y)
@@ -2493,12 +2870,17 @@ static void render_and_combine_glyphs(RenderContext *state,
 
             if (new_run) {
                 if (nb_bitmaps >= text_info->max_bitmaps) {
-                    size_t new_size = 2 * text_info->max_bitmaps;
-                    if (!ASS_REALLOC_ARRAY(text_info->combined_bitmaps, new_size))
+                    size_t old_size = text_info->max_bitmaps;
+                    size_t new_size = 2 * old_size;
+                    if (!ASS_REALLOC_ARRAY(text_info->combined_bitmaps, new_size)) {
+                        state->alloc_error = true;
                         continue;
+                    }
 
                     text_info->max_bitmaps = new_size;
                     combined_info = text_info->combined_bitmaps;
+                    memset(combined_info + old_size, 0,
+                           (new_size - old_size) * sizeof(*combined_info));
                 }
                 current_info = &combined_info[nb_bitmaps];
 
@@ -2515,9 +2897,6 @@ static void render_and_combine_glyphs(RenderContext *state,
                 filter->be = info->be;
 
                 int32_t shadow_mask_x, shadow_mask_y;
-                double blur_radius_scale = 2 / sqrt(log(256));
-                double blur_scale_x = state->blur_scale_x * blur_radius_scale;
-                double blur_scale_y = state->blur_scale_y * blur_radius_scale;
                 filter->blur_x = quantize_blur(info->blur * blur_scale_x, &shadow_mask_x);
                 filter->blur_y = quantize_blur(info->blur * blur_scale_y, &shadow_mask_y);
                 if (flags & FILTER_NONZERO_SHADOW) {
@@ -2532,12 +2911,16 @@ static void render_and_combine_glyphs(RenderContext *state,
                 current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
                 current_info->image = NULL;
 
-                current_info->bitmap_count = current_info->max_bitmap_count = 0;
-                current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
-                if (!current_info->bitmaps)
-                    continue;
+                current_info->bitmap_count = 0;
+                if (!current_info->bitmaps) {
+                    current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
+                    if (!current_info->bitmaps) {
+                        state->alloc_error = true;
+                        continue;
+                    }
 
-                current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                    current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                }
 
                 nb_bitmaps++;
                 new_run = false;
@@ -2555,8 +2938,10 @@ static void render_and_combine_glyphs(RenderContext *state,
 
             if (current_info->bitmap_count >= current_info->max_bitmap_count) {
                 size_t new_size = 2 * current_info->max_bitmap_count;
-                if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size))
+                if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size)) {
+                    state->alloc_error = true;
                     continue;
+                }
 
                 current_info->max_bitmap_count = new_size;
             }
@@ -2573,10 +2958,8 @@ static void render_and_combine_glyphs(RenderContext *state,
 
     for (int i = 0; i < nb_bitmaps; i++) {
         CombinedBitmapInfo *info = &combined_info[i];
-        if (!info->bitmap_count) {
-            free(info->bitmaps);
+        if (!info->bitmap_count)
             continue;
-        }
 
         if (info->effect_type == EF_KARAOKE_KF)
             info->effect_timing = lround(d6_to_double(info->leftmost_x) +
@@ -2593,9 +2976,22 @@ static void render_and_combine_glyphs(RenderContext *state,
         key.filter = info->filter;
         key.bitmap_count = info->bitmap_count;
         key.bitmaps = info->bitmaps;
-        CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache, &key, render_priv);
-        if (!val)
+        bool owned_bitmaps = !info->reuse_bitmaps;
+        key.owns_bitmaps = owned_bitmaps;
+        CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache,
+                state->cache_client, &key, render_priv);
+        if (owned_bitmaps)
+            info->reuse_bitmaps = val != NULL;
+        else if (!key.bitmaps)
+            info->reuse_bitmaps = false;
+        if (!key.bitmaps) {
+            info->bitmaps = NULL;
+            info->max_bitmap_count = 0;
+        }
+        if (!val) {
+            state->alloc_error = true;
             continue;
+        }
 
         if (val->bm.buffer)
             info->bm = &val->bm;
@@ -2725,11 +3121,12 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     }
 
     int flags = k->filter.flags;
+    bool fast_blur = flags & FILTER_FAST_BLUR;
     double r2x = restore_blur(k->filter.blur_x);
     double r2y = restore_blur(k->filter.blur_y);
     if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
+        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, fast_blur, r2x, r2y);
+    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, fast_blur, r2x, r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -2780,18 +3177,576 @@ static void add_background(RenderContext *state, EventImages *event_images)
     int h = bottom - top;
     if (w < 1 || h < 1)
         return;
+    uint32_t clr = state->c[3];
+    ass_apply_fade(&clr, state->fade);
+    if (_a(clr) == 0xFF)
+        return;
     void *nbuffer = ass_aligned_alloc(1, w * h, false);
     if (!nbuffer)
         return;
     memset(nbuffer, 0xFF, w * h);
-    uint32_t clr = state->c[3];
-    ass_apply_fade(&clr, state->fade);
-    ASS_Image *img = my_draw_bitmap(nbuffer, w, h, w, left, top,
+    ASS_Image *img = my_draw_bitmap(state->image_pool, nbuffer, w, h, w, left, top,
                                     clr, NULL);
     if (img) {
         img->next = event_images->imgs;
         event_images->imgs = img;
     }
+}
+
+static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
+{
+    ASS_Track *track = render_priv->track;
+
+    ass_shaper_set_kerning(shaper, track->Kerning);
+    ass_shaper_set_language(shaper, track->Language);
+    ass_shaper_set_level(shaper, render_priv->settings.shaper);
+#ifdef USE_FRIBIDI_EX_API
+    ass_shaper_set_bidi_brackets(shaper,
+            track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_BIDI_BRACKETS));
+#endif
+    ass_shaper_set_whole_text_layout(shaper,
+            track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_WHOLE_TEXT_LAYOUT));
+}
+
+// ---- Static-event layout cache -------------------------------------------
+//
+// For an event with no time-dependent overrides (and no scrolling transition),
+// the entire parse/shape/layout pipeline up to render_and_combine_glyphs is a
+// pure function of (event, renderer config). We snapshot its result on the
+// first render (a miss) and restore it on later frames (a hit), skipping the
+// pipeline. See ass_render.h:LayoutSnapshot for the storage/lifetime model.
+
+// Copy one laid-out glyph (cluster head or chain node) into snapshot/live
+// storage: drop the per-render bitmap pointers and the drawing-text view (both
+// unused past the cache boundary). Snapshot copies (take_ref) take a counted
+// ref on outline/font so they survive LRU eviction; live restore copies borrow.
+static void copy_layout_glyph(GlyphInfo *dst, const GlyphInfo *src, bool take_ref)
+{
+    *dst = *src;
+    dst->bm = dst->bm_o = NULL;
+    dst->drawing_text = (ASS_StringView) { NULL, 0 };
+    dst->next = NULL;
+    if (take_ref) {
+        if (dst->outline)
+            ass_cache_inc_ref(dst->outline);
+        if (dst->font)
+            ass_cache_inc_ref(dst->font);
+    }
+}
+
+// Free a cluster next-chain (the head struct itself is array-owned, kept).
+// Snapshot chains dec_ref their counted refs; live restore chains only borrow.
+static void free_layout_chain(GlyphInfo *head, bool dec_ref)
+{
+    GlyphInfo *node = head->next;
+    head->next = NULL;
+    while (node) {
+        GlyphInfo *next = node->next;
+        if (dec_ref) {
+            if (node->outline)
+                ass_cache_dec_ref(node->outline);
+            if (node->font)
+                ass_cache_dec_ref(node->font);
+        }
+        free(node);
+        node = next;
+    }
+}
+
+static void layout_snapshot_free_contents(LayoutSnapshot *snap)
+{
+    for (int i = 0; i < snap->length; i++) {
+        GlyphInfo *head = &snap->glyphs[i];
+        free_layout_chain(head, true);
+        if (head->outline)
+            ass_cache_dec_ref(head->outline);
+        if (head->font)
+            ass_cache_dec_ref(head->font);
+    }
+    for (unsigned i = 0; i < snap->n_bitmaps; i++) {
+        if (snap->combined_bitmaps[i].image)
+            ass_cache_dec_ref(snap->combined_bitmaps[i].image);
+    }
+    // Drop the snapshot's ref on each shared master; source-backed cached images
+    // borrow the composite pinned via combined_bitmaps above (no per-image ref).
+    for (unsigned i = 0; i < snap->n_images; i++) {
+        if (snap->images[i].shared)
+            shared_buffer_unref(snap->images[i].shared);
+    }
+    free(snap->images);
+    free(snap->combined_bitmaps);
+    free(snap->glyphs);
+    free(snap->lines);
+    free(snap->clip_drawing_text);
+    free(snap);
+}
+
+// Registry unlink; caller must hold layout_cache_mutex.
+static void layout_registry_unlink(ASS_Renderer *priv, LayoutSnapshot *snap)
+{
+    if (snap->reg_prev)
+        snap->reg_prev->reg_next = snap->reg_next;
+    else if (priv->layout_cache == snap)
+        priv->layout_cache = snap->reg_next;
+    if (snap->reg_next)
+        snap->reg_next->reg_prev = snap->reg_prev;
+    snap->reg_prev = snap->reg_next = NULL;
+}
+
+// Evict one snapshot: unlink from the registry, detach from its event, dec_ref
+// and free. dec_ref happens outside the lock.
+static void free_layout_snapshot(LayoutSnapshot *snap)
+{
+    if (!snap)
+        return;
+    ASS_Renderer *priv = snap->owner;
+    layout_cache_lock(priv);
+    layout_registry_unlink(priv, snap);
+    if (snap->back)
+        snap->back->layout = NULL;
+    layout_cache_unlock(priv);
+    layout_snapshot_free_contents(snap);
+}
+
+// Drop every live snapshot (on generation change and at renderer teardown).
+static void layout_cache_flush(ASS_Renderer *priv)
+{
+    layout_cache_lock(priv);
+    LayoutSnapshot *snap = priv->layout_cache;
+    priv->layout_cache = NULL;
+    for (LayoutSnapshot *s = snap; s; s = s->reg_next)
+        if (s->back)
+            s->back->layout = NULL;
+    layout_cache_unlock(priv);
+    while (snap) {
+        LayoutSnapshot *next = snap->reg_next;
+        snap->reg_prev = snap->reg_next = NULL;
+        layout_snapshot_free_contents(snap);
+        snap = next;
+    }
+}
+
+// In the default bounded mode, drop snapshots that were not used in the
+// immediately preceding frame. Detach the stale entries under the registry
+// lock, then release their cache references outside it.
+static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame)
+{
+    LayoutSnapshot *stale = NULL;
+
+    layout_cache_lock(priv);
+    for (LayoutSnapshot *snap = priv->layout_cache, *next; snap; snap = next) {
+        next = snap->reg_next;
+        if (snap->last_used_frame >= oldest_frame)
+            continue;
+        layout_registry_unlink(priv, snap);
+        if (snap->back)
+            snap->back->layout = NULL;
+        snap->reg_next = stale;
+        stale = snap;
+    }
+    layout_cache_unlock(priv);
+
+    while (stale) {
+        LayoutSnapshot *next = stale->reg_next;
+        stale->reg_prev = stale->reg_next = NULL;
+        layout_snapshot_free_contents(stale);
+        stale = next;
+    }
+}
+
+void ass_render_priv_done(RenderPriv *priv)
+{
+    if (!priv)
+        return;
+    if (priv->layout)
+        free_layout_snapshot(priv->layout);
+    free(priv);
+}
+
+// Memoized time-dependent-tag scan, keyed on the event's Text pointer (like
+// has_hard_overrides). Combined with the evt_type scroll check, this is the
+// layout-cache eligibility gate.
+static bool event_has_time_dependent_tags(RenderPriv *rp, ASS_Event *event)
+{
+    if (!rp)
+        return ass_event_has_time_dependent_tags(event->Text);
+    if (rp->time_dep_text != event->Text) {
+        rp->has_time_dep_tags = ass_event_has_time_dependent_tags(event->Text);
+        rp->time_dep_text = event->Text;
+    }
+    return rp->has_time_dep_tags;
+}
+
+// Build a snapshot of the fully laid-out event (called on a cacheable miss,
+// just before render_and_combine_glyphs). On any allocation failure the event
+// is simply not cached (the render proceeds normally).
+static void build_layout_snapshot(RenderContext *state, RenderPriv *rp,
+                                  double device_x, double device_y,
+                                  const ASS_DRect *bbox)
+{
+    ASS_Renderer *priv = state->renderer;
+    TextInfo *ti = &state->text_info;
+    int length = ti->length;
+
+    // A stale snapshot should have been evicted at lookup; drop any survivor.
+    if (rp->layout) {
+        free_layout_snapshot(rp->layout);
+        rp->layout = NULL;
+    }
+
+    LayoutSnapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap)
+        return;
+    snap->owner = priv;
+    snap->back = rp;
+    snap->gen = priv->layout_gen;
+    snap->last_used_frame = priv->layout_frame;
+
+    snap->glyphs = calloc(length, sizeof(GlyphInfo));
+    if (length && !snap->glyphs) {
+        free(snap);
+        return;
+    }
+    for (int i = 0; i < length; i++) {
+        GlyphInfo *head = &snap->glyphs[i];
+        copy_layout_glyph(head, &ti->glyphs[i], true);
+        GlyphInfo *src = ti->glyphs[i].next;
+        GlyphInfo **tail = &head->next;
+        while (src) {
+            GlyphInfo *node = malloc(sizeof(GlyphInfo));
+            if (!node)
+                goto fail;
+            copy_layout_glyph(node, src, true);
+            *tail = node;
+            tail = &node->next;
+            src = src->next;
+        }
+        snap->length = i + 1;
+    }
+
+    snap->n_lines = ti->n_lines;
+    if (ti->n_lines) {
+        snap->lines = malloc(ti->n_lines * sizeof(LineInfo));
+        if (!snap->lines)
+            goto fail;
+        memcpy(snap->lines, ti->lines, ti->n_lines * sizeof(LineInfo));
+    }
+    snap->height = ti->height;
+    snap->border_top = ti->border_top;
+    snap->border_bottom = ti->border_bottom;
+    snap->border_x = ti->border_x;
+
+    snap->blur_scale_x = state->blur_scale_x;
+    snap->blur_scale_y = state->blur_scale_y;
+    snap->border_scale_x = state->border_scale_x;
+    snap->border_scale_y = state->border_scale_y;
+    snap->screen_scale_x = state->screen_scale_x;
+    snap->screen_scale_y = state->screen_scale_y;
+    snap->border_style = state->border_style;
+    snap->back_color = state->c[3];
+    snap->fade = state->fade;
+    snap->shadow_x = state->shadow_x;
+    snap->shadow_y = state->shadow_y;
+    snap->clip_x0 = state->clip_x0;
+    snap->clip_y0 = state->clip_y0;
+    snap->clip_x1 = state->clip_x1;
+    snap->clip_y1 = state->clip_y1;
+    snap->clip_mode = state->clip_mode;
+    if (state->clip_drawing_text.str) {
+        snap->clip_drawing_text = ass_copy_string(state->clip_drawing_text);
+        if (!snap->clip_drawing_text)
+            goto fail;
+        snap->clip_drawing_len = state->clip_drawing_text.len;
+    }
+    snap->clip_drawing_scale = state->clip_drawing_scale;
+    snap->clip_drawing_mode = state->clip_drawing_mode;
+    snap->detect_collisions = state->detect_collisions;
+    snap->alignment = state->alignment;
+
+    snap->device_x = device_x;
+    snap->device_y = device_y;
+    snap->bbox = *bbox;
+
+    layout_cache_lock(priv);
+    snap->reg_prev = NULL;
+    snap->reg_next = priv->layout_cache;
+    if (priv->layout_cache)
+        priv->layout_cache->reg_prev = snap;
+    priv->layout_cache = snap;
+    layout_cache_unlock(priv);
+    rp->layout = snap;
+    return;
+
+fail:
+    // A chain malloc failed mid-head: clean the partially-built head (not yet
+    // counted in snap->length) before the generic free.
+    if (snap->glyphs && snap->length < length) {
+        GlyphInfo *head = &snap->glyphs[snap->length];
+        free_layout_chain(head, true);
+        if (head->outline)
+            ass_cache_dec_ref(head->outline);
+        if (head->font)
+            ass_cache_dec_ref(head->font);
+    }
+    layout_snapshot_free_contents(snap);
+}
+
+// Restore a snapshot into the live (thread-local) RenderContext, ready to skip
+// straight to render_and_combine_glyphs. Returns false on allocation failure,
+// leaving text_info empty so the caller can fall back to the full pipeline.
+static bool restore_layout_snapshot(RenderContext *state, const LayoutSnapshot *snap,
+                                    ASS_Event *event, double *device_x,
+                                    double *device_y, ASS_DRect *bbox)
+{
+    TextInfo *ti = &state->text_info;
+    int length = snap->length;
+
+    // The snapshot may have been built by another worker whose RenderContext
+    // grew larger; grow glyphs/event_text/breaks together to preserve the
+    // invariant the miss path relies on.
+    if (length > ti->max_glyphs) {
+        int new_max = length;
+        if (!ASS_REALLOC_ARRAY(ti->glyphs, new_max) ||
+                !ASS_REALLOC_ARRAY(ti->event_text, new_max) ||
+                !ASS_REALLOC_ARRAY(ti->breaks, new_max))
+            return false;
+        ti->max_glyphs = new_max;
+    }
+    if (snap->n_lines > ti->max_lines) {
+        int new_max = snap->n_lines;
+        if (!ASS_REALLOC_ARRAY(ti->lines, new_max))
+            return false;
+        ti->max_lines = new_max;
+    }
+
+    for (int i = 0; i < length; i++) {
+        copy_layout_glyph(&ti->glyphs[i], &snap->glyphs[i], false);
+        GlyphInfo *src = snap->glyphs[i].next;
+        GlyphInfo **tail = &ti->glyphs[i].next;
+        while (src) {
+            GlyphInfo *node = malloc(sizeof(GlyphInfo));
+            if (!node) {
+                for (int k = 0; k <= i; k++)
+                    free_layout_chain(&ti->glyphs[k], false);
+                ti->length = 0;
+                return false;
+            }
+            copy_layout_glyph(node, src, false);
+            *tail = node;
+            tail = &node->next;
+            src = src->next;
+        }
+    }
+    ti->length = length;
+    ti->n_lines = snap->n_lines;
+    if (snap->n_lines)
+        memcpy(ti->lines, snap->lines, snap->n_lines * sizeof(LineInfo));
+    ti->height = snap->height;
+    ti->border_top = snap->border_top;
+    ti->border_bottom = snap->border_bottom;
+    ti->border_x = snap->border_x;
+
+    state->event = event;
+    state->blur_scale_x = snap->blur_scale_x;
+    state->blur_scale_y = snap->blur_scale_y;
+    state->border_scale_x = snap->border_scale_x;
+    state->border_scale_y = snap->border_scale_y;
+    state->screen_scale_x = snap->screen_scale_x;
+    state->screen_scale_y = snap->screen_scale_y;
+    state->border_style = snap->border_style;
+    state->c[3] = snap->back_color;
+    state->fade = snap->fade;
+    state->shadow_x = snap->shadow_x;
+    state->shadow_y = snap->shadow_y;
+    state->clip_x0 = snap->clip_x0;
+    state->clip_y0 = snap->clip_y0;
+    state->clip_x1 = snap->clip_x1;
+    state->clip_y1 = snap->clip_y1;
+    state->clip_mode = snap->clip_mode;
+    state->clip_drawing_text.str = snap->clip_drawing_text;
+    state->clip_drawing_text.len = snap->clip_drawing_len;
+    state->clip_drawing_scale = snap->clip_drawing_scale;
+    state->clip_drawing_mode = snap->clip_drawing_mode;
+    state->detect_collisions = snap->detect_collisions;
+    state->alignment = snap->alignment;
+
+    *device_x = snap->device_x;
+    *device_y = snap->device_y;
+    *bbox = snap->bbox;
+    return true;
+}
+
+static ASS_Image *ass_free_image(ASS_Image *img);
+
+// Capture the emitted ASS_Image list of a static event (post render_text +
+// add_background) so a later hit can skip render_text entirely. Runs on the miss
+// frame, after the combined snapshot is built. Each image is either source-backed
+// (borrows the composite pinned via combined_bitmaps) or owns a buffer (vector
+// clip / opaque-box background) whose pixels are captured once into a ref-counted
+// read-only SharedBuffer (no per-clone copy). On any allocation failure the
+// partial capture is rolled back and images_cached stays false, so hits fall back
+// to render_text.
+static void build_image_snapshot(RenderContext *state, LayoutSnapshot *snap,
+                                 ASS_Image *imgs)
+{
+    unsigned n = 0;
+    for (ASS_Image *cur = imgs; cur; cur = cur->next)
+        n++;
+    if (!n) {
+        snap->images_cached = true;   // trivial (empty) list is a valid cache
+        return;
+    }
+    CachedImage *arr = malloc(n * sizeof(CachedImage));
+    if (!arr)
+        return;
+    unsigned align = 1 << state->renderer->engine.align_order;
+    unsigned i = 0;
+    for (ASS_Image *cur = imgs; cur; cur = cur->next, i++) {
+        ASS_ImagePriv *priv = (ASS_ImagePriv *) cur;
+        CachedImage *ci = &arr[i];
+        ci->result = *cur;            // struct fields incl. the bitmap pointer
+        ci->result.next = NULL;
+        ci->source = priv->source;    // NULL => owned-buffer; else pinned composite
+        ci->shared = NULL;
+        if (!priv->source) {
+            // Owned-buffer image: bitmap == buffer (start of the aligned alloc),
+            // valid extent stride*(h-1)+w per the ASS_Image contract.
+            size_t size = cur->h > 0 ? (size_t) cur->stride * (cur->h - 1) + cur->w : 0;
+            SharedBuffer *sb = size ? shared_buffer_new(align, cur->bitmap, size) : NULL;
+            if (!sb) {                // OOM or degenerate 0-size owned buffer: don't cache
+                for (unsigned k = 0; k < i; k++)
+                    if (arr[k].shared)
+                        shared_buffer_unref(arr[k].shared);
+                free(arr);
+                return;
+            }
+            ci->shared = sb;
+            ci->result.bitmap = sb->data;   // clones point into the shared master
+        }
+        // source-backed: ci->result.bitmap keeps its pointer into the pinned
+        // composite buffer (kept alive by the combined snapshot's inc_ref).
+    }
+    snap->images = arr;
+    snap->n_images = n;
+    snap->images_cached = true;
+}
+
+// Reconstruct the cached emitted ASS_Image list into fresh pool shells. Source-
+// backed images inc_ref the pinned composite; owned-buffer images take a ref on
+// the shared read-only master — so every emitted image independently keeps its
+// bitmap alive (surviving snapshot free / gen bump), exactly as render_text's
+// output does, with no per-clone pixel copy. Returns the list via *out and true;
+// on pool-shell OOM frees the partial list and returns false (caller runs
+// render_text instead).
+static bool clone_image_snapshot(RenderContext *state, const LayoutSnapshot *snap,
+                                 ASS_Image **out)
+{
+    ASS_Image *head = NULL, **tail = &head;
+    for (unsigned i = 0; i < snap->n_images; i++) {
+        const CachedImage *ci = &snap->images[i];
+        ASS_ImagePriv *img = image_pool_alloc(state->image_pool);
+        if (!img) {
+            for (ASS_Image *cur = head; cur; )
+                cur = ass_free_image(cur);
+            *out = NULL;
+            return false;
+        }
+        img->result = ci->result;     // incl. bitmap ptr into composite or master
+        img->result.next = NULL;
+        img->ref_count = 0;
+        img->buffer = NULL;
+        img->source = ci->source;
+        img->shared = ci->shared;
+        if (ci->source)
+            ass_cache_inc_ref(ci->source);
+        else
+            shared_buffer_ref(ci->shared);
+        *tail = &img->result;         // link before next iter so fail path frees it
+        tail = &img->result.next;
+    }
+    *out = head;
+    return true;
+}
+
+// Extend a freshly-built layout snapshot with the combined-bitmap output of
+// render_and_combine_glyphs, so later frames skip that per-frame work too. Holds
+// an inc_ref on each group's composite `image` (which owns bm/bm_o/bm_s), just as
+// the snapshot holds outline/font refs. render_text() reads only bm/bm_o/bm_s,
+// x/y, c[], effect_*, and image, so the per-group `bitmaps` key array (owned by
+// the RenderContext) is not copied. Returns false on OOM (caller drops the
+// whole snapshot, so a surviving snapshot always carries its combined bitmaps).
+static bool build_combined_snapshot(LayoutSnapshot *snap, TextInfo *ti)
+{
+    unsigned n = ti->n_bitmaps;
+    // A group that produced a composite (image != NULL) but whose bm/bm_o/bm_s are
+    // all empty is an allocation-failure artifact: a successful composite of a
+    // non-empty group (bitmap_count > 0, guaranteed here — empty groups are
+    // skipped in render_and_combine_glyphs) always yields at least one non-empty
+    // buffer. Refuse to snapshot such an event: pinning (inc_ref) the empty
+    // composite would freeze the best-effort-degraded render on every later hit,
+    // defeating the self-heal a re-render gives once memory frees up. Falling back
+    // to running render_and_combine_glyphs each frame tracks the shared composite
+    // cache exactly as the non-cached path does.
+    for (unsigned i = 0; i < n; i++) {
+        CombinedBitmapInfo *s = &ti->combined_bitmaps[i];
+        if (s->image && !s->bm && !s->bm_o && !s->bm_s)
+            return false;
+    }
+    if (n) {
+        snap->combined_bitmaps = malloc(n * sizeof(CombinedBitmapInfo));
+        if (!snap->combined_bitmaps)
+            return false;
+        for (unsigned i = 0; i < n; i++) {
+            CombinedBitmapInfo *dst = &snap->combined_bitmaps[i];
+            *dst = ti->combined_bitmaps[i];
+            dst->bitmaps = NULL;          // key array belongs to the RenderContext
+            dst->max_bitmap_count = 0;
+            dst->bitmap_count = 0;
+            dst->reuse_bitmaps = false;
+            if (dst->image)
+                ass_cache_inc_ref(dst->image);
+        }
+    }
+    snap->n_bitmaps = n;
+    return true;
+}
+
+// Restore cached combined bitmaps into the live RenderContext, ready to skip
+// straight to render_text(). Copies only the fields render_text/add_background
+// read, preserving the context's reusable per-group `bitmaps` key arrays. The
+// composite `image` (and thus bm/bm_o/bm_s) is kept alive by the snapshot's ref.
+// Returns false on OOM (caller falls back to running render_and_combine_glyphs).
+static bool restore_combined_snapshot(RenderContext *state, const LayoutSnapshot *snap)
+{
+    TextInfo *ti = &state->text_info;
+    unsigned n = snap->n_bitmaps;
+    if (n > ti->max_bitmaps) {
+        unsigned old_max = ti->max_bitmaps;
+        unsigned new_max = n;
+        if (!ASS_REALLOC_ARRAY(ti->combined_bitmaps, new_max))
+            return false;
+        memset(ti->combined_bitmaps + old_max, 0,
+               (new_max - old_max) * sizeof(CombinedBitmapInfo));
+        ti->max_bitmaps = new_max;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        CombinedBitmapInfo *dst = &ti->combined_bitmaps[i];
+        const CombinedBitmapInfo *src = &snap->combined_bitmaps[i];
+        dst->filter = src->filter;
+        dst->c[0] = src->c[0]; dst->c[1] = src->c[1];
+        dst->c[2] = src->c[2]; dst->c[3] = src->c[3];
+        dst->effect_type = src->effect_type;
+        dst->effect_timing = src->effect_timing;
+        dst->leftmost_x = src->leftmost_x;
+        dst->x = src->x;
+        dst->y = src->y;
+        dst->bm = src->bm;
+        dst->bm_o = src->bm_o;
+        dst->bm_s = src->bm_s;
+        dst->image = src->image;
+    }
+    ti->n_bitmaps = n;
+    return true;
 }
 
 /**
@@ -2801,9 +3756,10 @@ static void add_background(RenderContext *state, EventImages *event_images)
  * Process event, appending resulting ASS_Image's to images_root.
  */
 static bool
-ass_render_event(RenderContext *state, ASS_Event *event,
-                 EventImages *event_images)
+ass_render_event(RenderContext *state, EventImages *event_images)
 {
+    ASS_Event *event = event_images->event;
+
     ASS_Renderer *render_priv = state->renderer;
     if (event->Style >= render_priv->track->n_styles) {
         ass_msg(render_priv->library, MSGL_WARN, "No style found");
@@ -2814,13 +3770,52 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         return false;
     }
 
+    TextInfo *text_info = &state->text_info;
+
+    // Shared geometry, produced by either the layout-cache restore (hit) or the
+    // full pipeline (miss) below, and consumed from the `render:` label onward.
+    int valign = 0;
+    double device_x = 0;
+    double device_y = 0;
+    ASS_DRect bbox;
+    bool built_layout = false;   // this frame built a fresh snapshot (miss path)
+
+    // On a static-layout-cache hit, restore the laid-out state and skip the
+    // whole parse/shape/layout pipeline.
+    RenderPriv *rp = get_render_priv(render_priv, event);
+    // A track can be shared by several renderers; the single per-event snapshot
+    // slot belongs to whichever renderer filled it. Only the owning renderer may
+    // use it — its outline/font refs live in that renderer's caches, so a foreign
+    // snapshot must be left untouched (this renderer just runs the full pipeline
+    // without caching while the other renderer is alive).
+    bool foreign_snapshot = rp && rp->layout && rp->layout->owner != render_priv;
+    if (rp && rp->layout && !foreign_snapshot) {
+        if (rp->layout->gen == render_priv->layout_gen &&
+                restore_layout_snapshot(state, rp->layout, event,
+                                        &device_x, &device_y, &bbox)) {
+            rp->layout->last_used_frame = render_priv->layout_frame;
+            valign = state->alignment & 12;
+            // A live snapshot always carries its combined bitmaps: restore them
+            // and skip render_and_combine_glyphs too. Only on an OOM growing the
+            // combined array do we fall back to running render_and_combine.
+            if (restore_combined_snapshot(state, rp->layout))
+                goto render_combined;
+            goto render;
+        }
+        // Own snapshot but stale generation, or a restore that ran out of
+        // memory: drop it and fall back to the full pipeline.
+        free_layout_snapshot(rp->layout);
+    }
+
+    {   // --- full layout pipeline (cache miss) ---
+    setup_shaper(state->shaper, render_priv);
+
     free_render_context(state);
     init_render_context(state, event);
 
     if (!parse_events(state, event))
         return false;
 
-    TextInfo *text_info = &state->text_info;
     if (text_info->length == 0) {
         // no valid symbols in the event; this can be smth like {comment}
         free_render_context(state);
@@ -2844,7 +3839,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 
     preliminary_layout(state);
 
-    int valign = state->alignment & 12;
+    valign = state->alignment & 12;
 
     int MarginL =
         (event->MarginL) ? event->MarginL : state->style->MarginL;
@@ -2869,14 +3864,13 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     align_lines(state, max_text_width);
 
     // determine text bounding box
-    ASS_DRect bbox;
     compute_string_bbox(text_info, &bbox);
 
     apply_baseline_shear(state);
 
     // determine device coordinates for text
-    double device_x = 0;
-    double device_y = 0;
+    device_x = 0;
+    device_y = 0;
 
     // handle positioned events first: an event can be both positioned and
     // scrolling, and the scrolling effect overrides the position on one axis
@@ -2993,9 +3987,31 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 
     calculate_rotation_params(state, &bbox, device_x, device_y);
 
+    // Cache this static event's laid-out state so later frames hit. Eligible =
+    // no scrolling/banner transition and no time-dependent override tags. Skip
+    // when another renderer owns the snapshot slot for this shared event.
+    if (rp && !foreign_snapshot &&
+            !(state->evt_type & (EVENT_HSCROLL | EVENT_VSCROLL)) &&
+            !event_has_time_dependent_tags(rp, event)) {
+        build_layout_snapshot(state, rp, device_x, device_y, &bbox);
+        built_layout = rp->layout != NULL;
+    }
+    }   // --- end full layout pipeline (cache miss) ---
+
+render:
     render_and_combine_glyphs(state, device_x, device_y);
 
-    memset(event_images, 0, sizeof(*event_images));
+    // Extend the fresh snapshot with the combined bitmaps just produced, so later
+    // frames skip render_and_combine too. If render_and_combine hit an allocation
+    // failure (its best-effort partial output would otherwise be frozen and the
+    // dropped glyphs lost on every future frame), or the copy itself OOMs, drop
+    // the whole snapshot so the next frame re-renders and self-heals. Either way
+    // the current frame is unaffected (it renders from the live text_info below).
+    if (built_layout &&
+            (state->alloc_error || !build_combined_snapshot(rp->layout, text_info)))
+        free_layout_snapshot(rp->layout);
+
+render_combined:
     // VSFilter does *not* shift lines with a border > margin to be within the
     // frame, so negative values for top and left may occur
     event_images->top = device_y - text_info->lines[0].asc - text_info->border_top;
@@ -3008,17 +4024,127 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         + 2 * text_info->border_x + 0.5;
     event_images->detect_collisions = state->detect_collisions;
     event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
-    event_images->event = event;
-    event_images->imgs = render_text(state);
 
-    if (state->border_style == 4)
-        add_background(state, event_images);
+    // Image-list cache: on a hit for a static event, clone the cached emitted
+    // images (skipping render_text/add_background). Any per-frame collision shift
+    // is applied by the frame assembly to this (pre-shift) clone exactly as it is
+    // to render_text's output, so caching stays bit-exact.
+    //
+    // Honor the same ownership/generation invariant as the restore paths (3756,
+    // 3956): only clone THIS renderer's own, current-generation snapshot. A
+    // foreign snapshot (shared track rendered by another renderer) was never
+    // restored into this frame's text_info — its images belong to a different
+    // config — and is also mutable state guarded by the OTHER renderer's lock, so
+    // cloning it would emit wrong output and race its free. Fall through to
+    // render_text instead, exactly as the miss path does for a foreign event.
+    if (!built_layout && rp && rp->layout && !foreign_snapshot &&
+            rp->layout->gen == render_priv->layout_gen &&
+            rp->layout->images_cached &&
+            clone_image_snapshot(state, rp->layout, &event_images->imgs)) {
+        // cached list already includes any border-style-4 background
+    } else {
+        event_images->imgs = render_text(state);
+
+        if (state->border_style == 4)
+            add_background(state, event_images);
+
+        // On the miss frame, capture the emitted (pre-shift) list so later hits
+        // can clone it — only when the snapshot survived (rp->layout != NULL, so
+        // its inc_ref keeps every source-backed image's composite alive).
+        if (built_layout && rp && rp->layout)
+            build_image_snapshot(state, rp->layout, event_images->imgs);
+    }
 
     ass_shaper_cleanup(state->shaper, text_info);
     free_render_context(state);
 
     return true;
 }
+
+#if ENABLE_THREADS
+#define MIN_THREADED_EVENTS 2
+
+static void *run_thread(void *ptr)
+{
+    ASS_Renderer *priv = ptr;
+
+    RenderContext state = {0};
+
+    thread_set_name("libass/render");
+
+    bool success = render_context_init(&state, priv);
+
+    pthread_mutex_lock(&priv->mutex);
+
+    if (!success) {
+        ass_msg(priv->library, MSGL_WARN, "Thread setup failed; disabling");
+        priv->thread_start_failed = 1;
+        pthread_cond_broadcast(&priv->main_cond);
+        goto fail;
+    }
+
+    priv->started_threads++;
+
+    pthread_cond_broadcast(&priv->main_cond);
+
+    for (;;) {
+        while (!priv->shutting_down &&
+               (atomic_load_explicit(&priv->next_eimg, memory_order_relaxed) >=
+                atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)))
+            pthread_cond_wait(&priv->pool_cond, &priv->mutex);
+
+        if (priv->shutting_down)
+            break;
+
+        priv->active_threads++;
+
+        pthread_mutex_unlock(&priv->mutex);
+
+        uintptr_t got_eimg;
+        AtomicInt completed = 0;
+        bool cascaded = false;
+        while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1, memory_order_relaxed)) < atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+            // Cascade: wake one sibling the first time we confirm there is more
+            // work, so the pool ramps up to the real parallelism (at most one
+            // signal per worker -> at most n_threads signals/frame, never per
+            // event). Done before rendering so the sibling wakes during this
+            // render. Frames the main thread can handle alone never reach here
+            // (no slot grabbed -> no cascade), so they don't wake the pool.
+            if (!cascaded && got_eimg + 1 < atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+                cascaded = true;
+                pthread_mutex_lock(&priv->mutex);
+                pthread_cond_signal(&priv->pool_cond);
+                pthread_mutex_unlock(&priv->mutex);
+            }
+
+            EventImages *imgs = priv->eimg + got_eimg;
+
+            ass_render_event(&state, imgs);
+            completed++;
+        }
+
+        // Publish the whole batch; acq_rel RMWs also carry earlier batches'
+        // writes to the participant or acquire load that observes completion.
+        if (completed)
+            atomic_fetch_sub_explicit(&priv->processing_eimgs, completed,
+                                      memory_order_acq_rel);
+
+        pthread_mutex_lock(&priv->mutex);
+
+        priv->active_threads--;
+
+        pthread_cond_signal(&priv->main_cond);
+    }
+
+fail:
+
+    pthread_mutex_unlock(&priv->mutex);
+
+    render_context_done(&state);
+
+    return NULL;
+}
+#endif
 
 /**
  * \brief Check cache limits and reset cache if they are exceeded
@@ -3028,21 +4154,6 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
     ass_cache_cut(cache->composite_cache, cache->composite_max_size);
     ass_cache_cut(cache->bitmap_cache, cache->bitmap_max_size);
     ass_cache_cut(cache->outline_cache, cache->glyph_max);
-}
-
-static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
-{
-    ASS_Track *track = render_priv->track;
-
-    ass_shaper_set_kerning(shaper, track->Kerning);
-    ass_shaper_set_language(shaper, track->Language);
-    ass_shaper_set_level(shaper, render_priv->settings.shaper);
-#ifdef USE_FRIBIDI_EX_API
-    ass_shaper_set_bidi_brackets(shaper,
-            track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_BIDI_BRACKETS));
-#endif
-    ass_shaper_set_whole_text_layout(shaper,
-            track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_WHOLE_TEXT_LAYOUT));
 }
 
 /**
@@ -3076,8 +4187,6 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
             render_priv->fontselect, render_priv->num_emfonts);
     }
 
-    setup_shaper(render_priv->state.shaper, render_priv);
-
     // PAR correction
     double par = render_priv->settings.par;
     bool lr_track = track->LayoutResX > 0 && track->LayoutResY > 0;
@@ -3097,6 +4206,52 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
     render_priv->prev_images_root = render_priv->images_root;
     render_priv->images_root = NULL;
 
+    // Layout cache invalidation: bump layout_gen on any track-side layout input
+    // that has no setter funnel (renderer-config setters bump it directly). This
+    // is the single per-frame funnel for track edits, embedded-font reload and
+    // per-track feature toggles. Whenever the gen advances (here or via a
+    // setter), flush the snapshot registry so stale entries stop pinning cache
+    // entries.
+    if (!render_priv->layout_seen.valid ||
+        render_priv->layout_seen.track != track ||
+        render_priv->layout_seen.play_res_x != track->PlayResX ||
+        render_priv->layout_seen.play_res_y != track->PlayResY ||
+        render_priv->layout_seen.layout_res_x != track->LayoutResX ||
+        render_priv->layout_seen.layout_res_y != track->LayoutResY ||
+        render_priv->layout_seen.wrap_style != track->WrapStyle ||
+        render_priv->layout_seen.kerning != track->Kerning ||
+        render_priv->layout_seen.scaled_border_and_shadow != track->ScaledBorderAndShadow ||
+        render_priv->layout_seen.feature_flags != track->parser_priv->feature_flags ||
+        render_priv->layout_seen.num_emfonts != render_priv->num_emfonts) {
+        render_priv->layout_gen++;
+        render_priv->layout_seen.valid = true;
+        render_priv->layout_seen.track = track;
+        render_priv->layout_seen.play_res_x = track->PlayResX;
+        render_priv->layout_seen.play_res_y = track->PlayResY;
+        render_priv->layout_seen.layout_res_x = track->LayoutResX;
+        render_priv->layout_seen.layout_res_y = track->LayoutResY;
+        render_priv->layout_seen.wrap_style = track->WrapStyle;
+        render_priv->layout_seen.kerning = track->Kerning;
+        render_priv->layout_seen.scaled_border_and_shadow = track->ScaledBorderAndShadow;
+        render_priv->layout_seen.feature_flags = track->parser_priv->feature_flags;
+        render_priv->layout_seen.num_emfonts = render_priv->num_emfonts;
+    }
+    if (render_priv->layout_gen != render_priv->layout_gen_flushed) {
+        layout_cache_flush(render_priv);
+        render_priv->layout_gen_flushed = render_priv->layout_gen;
+    }
+
+    // By default, snapshots cover runs of consecutive active frames only. The
+    // opt-in feature keeps the old persistent behavior for seek/replay-heavy
+    // clients. Pruning happens before workers start, after the previous frame is
+    // complete, so registry entries cannot be in use here.
+    render_priv->layout_frame++;
+    if (!(track->parser_priv->feature_flags &
+            FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT)) &&
+            render_priv->layout_frame > 1 && render_priv->layout_cache)
+        layout_cache_prune(render_priv, render_priv->layout_frame - 1);
+
+    ass_cache_promote(&render_priv->cache.client_set);
     check_cache_limits(render_priv, &render_priv->cache);
 
     return true;
@@ -3106,6 +4261,12 @@ static int cmp_event_layer(const void *p1, const void *p2)
 {
     ASS_Event *e1 = ((EventImages *) p1)->event;
     ASS_Event *e2 = ((EventImages *) p2)->event;
+    if (!e1 && !e2)
+        return 0;
+    if (e1 && !e2)
+        return -1;
+    if (!e1 && e2)
+        return 1;
     if (e1->Layer < e2->Layer)
         return -1;
     if (e1->Layer > e2->Layer)
@@ -3115,6 +4276,44 @@ static int cmp_event_layer(const void *p1, const void *p2)
     if (e1->ReadOrder > e2->ReadOrder)
         return 1;
     return 0;
+}
+
+static bool stable_sort_events_by_layer(ASS_Renderer *render_priv,
+                                        EventImages *events, int cnt,
+                                        int min_layer, int max_layer)
+{
+    long long layer_range_ll = (long long) max_layer - min_layer + 1;
+    if (layer_range_ll <= 0 || layer_range_ll > MAX_LAYER_SORT_RANGE)
+        return false;
+
+    if (cnt > render_priv->eimg_sorted_size) {
+        EventImages *sorted =
+            ass_realloc_array(render_priv->eimg_sorted, cnt, sizeof(*sorted));
+        if (!sorted)
+            return false;
+        render_priv->eimg_sorted = sorted;
+        render_priv->eimg_sorted_size = cnt;
+    }
+
+    int layer_range = (int) layer_range_ll;
+    int counts[MAX_LAYER_SORT_RANGE] = { 0 };
+    int offsets[MAX_LAYER_SORT_RANGE];
+    for (int i = 0; i < cnt; i++)
+        counts[(int) ((long long) events[i].event->Layer - min_layer)]++;
+
+    int pos = 0;
+    for (int i = 0; i < layer_range; i++) {
+        offsets[i] = pos;
+        pos += counts[i];
+    }
+
+    for (int i = 0; i < cnt; i++) {
+        int layer = (int) ((long long) events[i].event->Layer - min_layer);
+        render_priv->eimg_sorted[offsets[layer]++] = events[i];
+    }
+
+    memcpy(events, render_priv->eimg_sorted, cnt * sizeof(*events));
+    return true;
 }
 
 static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
@@ -3146,11 +4345,30 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
             return NULL;
     }
     if (render_priv->render_id != event->render_priv->render_id) {
+        // The layout cache is normally flushed in ass_start_frame before any
+        // event is rendered, so ->layout is already NULL here; free defensively
+        // to avoid orphaning a snapshot if it somehow survives.
+        if (event->render_priv->layout)
+            free_layout_snapshot(event->render_priv->layout);
         memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
         event->render_priv->render_id = render_priv->render_id;
     }
 
     return event->render_priv;
+}
+
+static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                     ASS_Event *event)
+{
+    ASS_RenderPriv *priv = get_render_priv(render_priv, event);
+    if (!priv)
+        return ass_event_has_hard_overrides(event->Text);
+
+    if (priv->hard_overrides_text != event->Text) {
+        priv->has_hard_overrides = ass_event_has_hard_overrides(event->Text);
+        priv->hard_overrides_text = event->Text;
+    }
+    return priv->has_hard_overrides;
 }
 
 static int overlap(Rect *s1, Rect *s2)
@@ -3365,6 +4583,48 @@ static int ass_detect_change(ASS_Renderer *priv)
     return diff;
 }
 
+#if ENABLE_THREADS
+static bool start_threads(ASS_Renderer *priv)
+{
+    // The calling thread renders from the same queue, so the pool only needs
+    // N - 1 workers to honor ass_set_threads(N).
+    unsigned workers = priv->settings.threads > 1 ?
+        priv->settings.threads - 1 : 0;
+
+    if (priv->n_threads == workers || priv->thread_start_failed)
+        return true;
+
+    join_threads(priv);
+
+    priv->shutting_down = 0;
+
+    if (!workers)
+        return true;
+
+    if (!(priv->threads = calloc(workers, sizeof(pthread_t)))) {
+        ass_msg(priv->library, MSGL_ERR, "Allocation failure");
+        return false;
+    }
+
+    for (priv->n_threads = 0; priv->n_threads < workers; priv->n_threads++) {
+        if (pthread_create(&priv->threads[priv->n_threads], NULL, run_thread, priv) != 0) {
+            pthread_mutex_lock(&priv->mutex);
+            ass_msg(priv->library, MSGL_WARN, "Thread startup failure");
+            priv->thread_start_failed = 1;
+            pthread_mutex_unlock(&priv->mutex);
+            return true;
+        }
+    }
+
+    pthread_mutex_lock(&priv->mutex);
+    while (priv->started_threads < priv->n_threads && !priv->thread_start_failed)
+        pthread_cond_wait(&priv->main_cond, &priv->mutex);
+    pthread_mutex_unlock(&priv->mutex);
+
+    return true;
+}
+#endif
+
 /**
  * \brief free a single image.
  * \param img image as returned by ass_render_frame().
@@ -3378,8 +4638,21 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
 
     ASS_ImagePriv *priv = (ASS_ImagePriv *) img;
     ass_cache_dec_ref(priv->source);
-    ass_aligned_free(priv->buffer);
-    free(priv);
+    if (priv->shared)
+        shared_buffer_unref(priv->shared);   // cloned owned-buffer image (buffer is NULL)
+    else
+        ass_aligned_free(priv->buffer);
+    ImagePool *pool = priv->pool;
+    if (pool) {
+        // Recycle the shell instead of returning it to the heap.
+        image_pool_lock(pool);
+        priv->result.next = (ASS_Image *) pool->free_list;
+        pool->free_list = priv;
+        pool->live--;
+        image_pool_unlock_or_destroy(pool);
+    } else {
+        free(priv);
+    }
 
     return next;
 }
@@ -3486,9 +4759,14 @@ static bool event_active(const ASS_Event *event, long long now)
     return event->Start <= now && now < event->Start + event->Duration;
 }
 
-static int render_events_at(ASS_Renderer *priv, ASS_Track *track, long long now)
+static int render_events_at(ASS_Renderer *priv, ASS_Track *track, long long now,
+                            bool *readorder_sorted, int *min_layer, int *max_layer)
 {
     int cnt = 0;
+    int last_read_order = INT_MIN;
+    *readorder_sorted = true;
+    *min_layer = INT_MAX;
+    *max_layer = INT_MIN;
     const int n = track->n_events;
     bool indexed = n >= EV_MIN_INDEXED;
     if (indexed) {
@@ -3536,8 +4814,16 @@ static int render_events_at(ASS_Renderer *priv, ASS_Track *track, long long now)
             priv->eimg_size += 100;
             priv->eimg = realloc(priv->eimg, priv->eimg_size * sizeof(EventImages));
         }
-        if (ass_render_event(&priv->state, event, priv->eimg + cnt))
-            cnt++;
+        if (cnt > 0 && event->ReadOrder <= last_read_order)
+            *readorder_sorted = false;
+        last_read_order = event->ReadOrder;
+        *min_layer = FFMIN(*min_layer, event->Layer);
+        *max_layer = FFMAX(*max_layer, event->Layer);
+        if (priv->stateless)
+            get_render_priv(priv, event);
+        priv->eimg[cnt++] = (EventImages){
+            .event = event,
+        };
     }
     return cnt;
 }
@@ -3566,11 +4852,98 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         priv->render_id++;
         priv->history_dependent = false;
     }
-    int cnt = render_events_at(priv, track, now);
+    bool readorder_sorted;
+    int min_layer, max_layer;
+    int cnt = render_events_at(priv, track, now, &readorder_sorted, &min_layer, &max_layer);
 
-    // sort by layer
-    if (cnt > 0)
-        qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
+#if ENABLE_THREADS
+    bool parallel = cnt >= MIN_THREADED_EVENTS;
+
+    // Do not allocate and initialize the worker pool until a frame can actually
+    // use it. Once a pool exists, still run start_threads on light frames so a
+    // changed ass_set_threads setting tears down/reconfigures it promptly.
+    if ((parallel || priv->n_threads) && !start_threads(priv))
+        return NULL;
+
+    // Waking the worker pool is disproportionately expensive for tiny active
+    // event sets; the serial path is byte-identical and much cheaper there.
+    if (parallel && priv->n_threads > 0 && !priv->thread_start_failed) {
+        pthread_mutex_lock(&priv->mutex);
+
+        while (priv->active_threads)
+            pthread_cond_wait(&priv->main_cond, &priv->mutex);
+
+        atomic_store_explicit(&priv->processing_eimgs, cnt, memory_order_release);
+        atomic_store_explicit(&priv->sent_eimgs, cnt, memory_order_release);
+        atomic_store_explicit(&priv->next_eimg, 0, memory_order_release);
+
+        // Wake ONE worker (not all of them). Workers cascade: each one that
+        // actually grabs an event wakes one more, but only while work remains,
+        // so the number of woken workers tracks the real parallelism. A frame
+        // the main thread can handle alone (warm/light) thus wakes ~1 worker
+        // instead of the whole pool -- no thundering herd -- while heavy frames
+        // still ramp up to full parallelism (the wake overlaps the first render).
+        pthread_cond_signal(&priv->pool_cond);
+
+        // Release the lock so workers can start stealing immediately, and let
+        // the main thread steal events from the same atomic queue instead of
+        // blocking idle until they finish. This adds one more renderer for
+        // large event sets, but still incurs queue and synchronization costs.
+        // Output is independent of which thread renders which event.
+        pthread_mutex_unlock(&priv->mutex);
+
+        bool main_done_all = false;
+        AtomicInt completed = 0;
+        uintptr_t got_eimg;
+        while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1,
+                        memory_order_relaxed)) <
+                atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+            ass_render_event(&priv->state, priv->eimg + got_eimg);
+            completed++;
+        }
+
+        // Only a nonempty batch can complete all outstanding work. Its acquire
+        // half observes earlier batch publications through the RMW sequence.
+        if (completed)
+            main_done_all = atomic_fetch_sub_explicit(&priv->processing_eimgs,
+                    completed, memory_order_acq_rel) == completed;
+
+        // Main exhausted the queue; wait for workers to finish any remaining
+        // events. (Re-checks the predicate under the lock, so a worker signal
+        // that races ahead of this lock is not lost.)
+        if (!main_done_all) {
+            pthread_mutex_lock(&priv->mutex);
+            while (atomic_load_explicit(&priv->processing_eimgs, memory_order_acquire))
+                pthread_cond_wait(&priv->main_cond, &priv->mutex);
+            pthread_mutex_unlock(&priv->mutex);
+        }
+    } else
+#endif
+    {
+        for (int i = 0; i < cnt; i++) {
+            ass_render_event(&priv->state, priv->eimg + i);
+        }
+    }
+
+    // sort by layer; cmp_event_layer is a total order (ReadOrder is unique),
+    // so the active set is very often already in sorted order (events are
+    // scanned in array order). Skip the qsort in that common case — same result.
+    if (cnt > 0) {
+        bool sorted = true;
+        for (int i = 1; i < cnt; i++) {
+            ASS_Event *a = priv->eimg[i - 1].event, *b = priv->eimg[i].event;
+            if (a->Layer > b->Layer ||
+                (a->Layer == b->Layer && a->ReadOrder >= b->ReadOrder)) {
+                sorted = false;
+                break;
+            }
+        }
+        if (!sorted &&
+                (!readorder_sorted ||
+                 !stable_sort_events_by_layer(priv, priv->eimg, cnt,
+                                              min_layer, max_layer)))
+            qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
+    }
 
     // call fix_collisions for each group of events with the same layer
     EventImages *last = priv->eimg;
